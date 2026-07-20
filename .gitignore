@@ -7,3 +7,4 @@ dist/
 # Ignore env/local config files
 .env
 .DS_Store
+/.idea/
