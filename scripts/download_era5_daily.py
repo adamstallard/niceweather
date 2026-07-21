@@ -2,247 +2,205 @@
 """
 download_era5_daily.py
 
-Downloads ERA5-Land post-processed daily statistics from the Copernicus
-Climate Data Store (CDS) for the variables needed to assess "perfect weather":
+Downloads ERA5 post-processed daily statistics from Copernicus CDS for
+perfect weather analysis:
 
-  - daily maximum 2m temperature        (for the ≥75°F check)
-  - daily maximum 2m dew point          (for the humidity check)
-  - daily mean surface solar radiation  (for the "mostly sunny" check)
+  - 2m temperature (daily maximum) — for ≥75°F check
+  - 2m dew point (daily maximum) — for humidity check (< 60°F)
+  - Total cloud cover (daily maximum) — for "sunny" check
 
-Precipitation is intentionally NOT included here — it is an accumulated
-variable excluded from the daily-statistics dataset. See download_era5_precip.py.
+Uses the exact Copernicus API request syntax (year-by-year for resumability).
 
 Requirements
-------------
-  pip install cdsapi>=0.7.7
+  pip install cdsapi
 
 CDS Authentication
-------------------
-  You need a free Copernicus account and an API key placed in:
-    ~/.cdsapirc
-  Format:
+  You need ~/.cdsapirc with your API key:
     url: https://cds.climate.copernicus.eu/api
     key: <your-api-key>
 
-  Get your key at: https://cds.climate.copernicus.eu/user/login
-
 Usage
------
-  python download_era5_daily.py [--years 1995 2024] [--resume]
+  python scripts/download_era5_daily.py --years 1995 2024
+  python scripts/download_era5_daily.py --years 2015 2024  # Test run
 
 Output
-------
-  data/raw/era5_daily/<year>/
-    tmax.nc       daily max 2m temperature (K)
-    dewpoint.nc   daily max 2m dew point (K)
-    solar.nc      daily mean surface solar radiation downwards (J/m²)
+  data/raw/era5_daily/<year>/data.nc
 """
 
 import argparse
-import hashlib
 import sys
 import time
+import zipfile
 from pathlib import Path
 
 import cdsapi
 
-# ---------------------------------------------------------------------------
 # Configuration
-# ---------------------------------------------------------------------------
-
-DATASET = "derived-era5-land-daily-statistics"
-
-# Variables to download from the daily statistics dataset
-VARIABLES = [
-    {
-        "name": "tmax",
-        "variable": "2m_temperature",
-        "daily_statistic": "daily_maximum",
-        "description": "daily max 2m temperature",
-    },
-    {
-        "name": "dewpoint",
-        "variable": "2m_dewpoint_temperature",
-        "daily_statistic": "daily_maximum",
-        "description": "daily max 2m dew point temperature",
-    },
-    {
-        "name": "solar",
-        "variable": "surface_solar_radiation_downwards",
-        "daily_statistic": "daily_mean",
-        "description": "daily mean surface solar radiation downwards",
-    },
-]
-
+DATASET = "derived-era5-single-levels-daily-statistics"
+OUTPUT_ROOT = Path("data/raw/era5_daily")
 MONTHS = [f"{m:02d}" for m in range(1, 13)]
 DAYS = [f"{d:02d}" for d in range(1, 32)]
-
-# CDS requests are year-by-year to keep request sizes manageable and allow
-# easy resumption if interrupted.
-DEFAULT_START_YEAR = 1995
-DEFAULT_END_YEAR = 2024
-
-OUTPUT_ROOT = Path("data/raw/era5_daily")
-
-# How many times to retry a failed download before giving up
 MAX_RETRIES = 3
-RETRY_DELAY_SECONDS = 60
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+RETRY_DELAY_SECONDS = 30
 
 
-def md5(path: Path) -> str:
-    """Compute MD5 hash of a file for basic integrity checks."""
-    h = hashlib.md5()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def file_is_valid_netcdf(path: Path) -> bool:
-    """Return True if the file exists, is non-empty, and opens as a NetCDF."""
-    if not path.exists() or path.stat().st_size == 0:
+def is_valid_netcdf(path: Path) -> bool:
+    """Check if file exists and is valid NetCDF."""
+    if not path.exists():
         return False
     try:
-        import netCDF4  # noqa: F401
-
-        with netCDF4.Dataset(path):
-            pass
+        import netCDF4
+        netCDF4.Dataset(path, "r").close()
         return True
     except Exception:
         return False
 
 
-def download_variable(
-    client: cdsapi.Client,
-    year: int,
-    var: dict,
-    out_path: Path,
-    *,
-    resume: bool = True,
-) -> bool:
-    """
-    Download one variable for one year.
-    Returns True on success, False on failure.
-    """
-    if resume and file_is_valid_netcdf(out_path):
-        print(f"  [SKIP] {out_path.name} already exists and is valid.")
+def download_year(client: cdsapi.Client, year: int, output_path: Path) -> bool:
+    """Download ERA5 daily for one year, month-by-month to avoid API size limits."""
+    if output_path.exists() and is_valid_netcdf(output_path):
+        size_mb = output_path.stat().st_size / 1_048_576
+        print(f"  [SKIP] {output_path.name} ({size_mb:.1f} MB)")
         return True
 
-    request = {
-        "variable": var["variable"],
-        "year": str(year),
-        "month": MONTHS,
-        "day": DAYS,
-        "daily_statistic": var["daily_statistic"],
-        # Use UTC+00:00 for consistency. The probability model uses a ±7-day
-        # calendar-day window so local-time offsets matter little at this step.
-        "time_zone": "utc+00:00",
-        "frequency": "1_hourly",
-        "format": "netcdf",
-    }
+    # Create temp files for each month, then combine
+    temp_dir = output_path.parent / "temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    month_files = []
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            print(
-                f"  [{attempt}/{MAX_RETRIES}] Downloading {var['description']}"
-                f" for {year} → {out_path.name}"
-            )
-            client.retrieve(DATASET, request, str(out_path))
+    for month_int in range(1, 13):
+        month_str = f"{month_int:02d}"
+        month_file = temp_dir / f"{year}_{month_str}.nc"
+        month_files.append(month_file)
 
-            if not file_is_valid_netcdf(out_path):
-                raise ValueError(f"Downloaded file failed validation: {out_path}")
+        if month_file.exists() and is_valid_netcdf(month_file):
+            size_mb = month_file.stat().st_size / 1_048_576
+            print(f"    [SKIP] {year}-{month_str} ({size_mb:.1f} MB)")
+            continue
 
-            size_mb = out_path.stat().st_size / 1_048_576
-            print(f"  [OK] {out_path.name}  ({size_mb:.1f} MB)")
-            return True
+        request = {
+            "product_type": "reanalysis",
+            "variable": [
+                "2m_dewpoint_temperature",
+                "2m_temperature",
+                "total_cloud_cover"
+            ],
+            "year": str(year),
+            "month": month_str,
+            "day": DAYS,
+            "daily_statistic": "daily_maximum",
+            "time_zone": "utc+00:00",
+            "frequency": "6_hourly",
+            "format": "netcdf"
+        }
 
-        except Exception as exc:
-            print(f"  [ERROR] Attempt {attempt} failed: {exc}")
-            # Remove the potentially corrupt partial file
-            if out_path.exists():
-                out_path.unlink()
-            if attempt < MAX_RETRIES:
-                print(f"  Retrying in {RETRY_DELAY_SECONDS}s …")
-                time.sleep(RETRY_DELAY_SECONDS)
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                print(f"    [{attempt}/{MAX_RETRIES}] Downloading {year}-{month_str}")
+                # Download to a temp zip file
+                temp_zip = month_file.with_suffix('.zip')
+                client.retrieve(DATASET, request, str(temp_zip))
 
-    print(f"  [FAIL] All {MAX_RETRIES} attempts failed for {var['name']} {year}.")
-    return False
+                # Extract NetCDF from ZIP
+                with zipfile.ZipFile(temp_zip, 'r') as zf:
+                    # Find the .nc file in the zip
+                    nc_files = [f for f in zf.namelist() if f.endswith('.nc')]
+                    if not nc_files:
+                        raise ValueError("No .nc file found in downloaded ZIP")
+                    # Extract the first .nc file with the target name
+                    zf.extract(nc_files[0], temp_dir)
+                    extracted_path = temp_dir / nc_files[0]
+                    # Rename to expected location
+                    extracted_path.rename(month_file)
+
+                # Clean up zip
+                temp_zip.unlink()
+
+                if not is_valid_netcdf(month_file):
+                    raise ValueError("NetCDF validation failed")
+
+                size_mb = month_file.stat().st_size / 1_048_576
+                print(f"    [OK] {year}-{month_str} ({size_mb:.1f} MB)")
+                break
+
+            except Exception as exc:
+                print(f"    [ERROR] Attempt {attempt}: {exc}", file=sys.stderr)
+                if month_file.exists():
+                    month_file.unlink()
+                temp_zip = month_file.with_suffix('.zip')
+                if temp_zip.exists():
+                    temp_zip.unlink()
+                if attempt < MAX_RETRIES:
+                    print(f"    Retrying in {RETRY_DELAY_SECONDS}s …")
+                    time.sleep(RETRY_DELAY_SECONDS)
+        else:
+            print(f"    [FAIL] {MAX_RETRIES} attempts failed for {year}-{month_str}", file=sys.stderr)
+            return False
+
+    # Combine all monthly files into one
+    print(f"  Combining months for {year} → {output_path.name}")
+    try:
+        import xarray as xr
+        datasets = [xr.open_dataset(f) for f in month_files]
+        combined = xr.concat(datasets, dim="time")
+        combined.to_netcdf(str(output_path))
+        for ds in datasets:
+            ds.close()
+        for f in month_files:
+            f.unlink()
+
+        size_mb = output_path.stat().st_size / 1_048_576
+        print(f"  [OK] Combined {year} ({size_mb:.1f} MB)")
+        return True
+    except Exception as exc:
+        print(f"  [ERROR] Failed to combine months: {exc}", file=sys.stderr)
+        return False
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-
-def parse_args() -> argparse.Namespace:
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Download ERA5-Land daily statistics (temp, dew point, solar) "
-        "for the Nice Weather project."
+        description="Download ERA5 daily statistics for perfect weather analysis."
     )
     parser.add_argument(
         "--years",
         nargs=2,
         type=int,
         metavar=("START", "END"),
-        default=[DEFAULT_START_YEAR, DEFAULT_END_YEAR],
-        help=f"Year range inclusive. Default: {DEFAULT_START_YEAR} {DEFAULT_END_YEAR}",
+        default=[1995, 2024],
     )
-    parser.add_argument(
-        "--no-resume",
-        action="store_true",
-        help="Re-download files even if they already exist.",
-    )
-    return parser.parse_args()
+    args = parser.parse_args()
 
-
-def main() -> None:
-    args = parse_args()
     start_year, end_year = args.years
-    resume = not args.no_resume
-
-    if start_year > end_year:
-        print("ERROR: START year must be ≤ END year.", file=sys.stderr)
-        sys.exit(1)
-
     years = list(range(start_year, end_year + 1))
-    print(f"Nice Weather — ERA5-Land Daily Statistics Downloader")
+
+    print("Nice Weather — ERA5 Daily Statistics Downloader")
     print(f"Years: {start_year}–{end_year}  ({len(years)} years)")
-    print(f"Variables: {', '.join(v['name'] for v in VARIABLES)}")
-    print(f"Resume mode: {'ON' if resume else 'OFF'}")
+    print(f"Variables: 2m temperature, 2m dew point, total cloud cover")
     print()
 
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     client = cdsapi.Client()
-
-    failures: list[tuple[int, str]] = []
+    failures = []
 
     for year in years:
-        year_dir = OUTPUT_ROOT / str(year)
-        year_dir.mkdir(parents=True, exist_ok=True)
+        output_path = OUTPUT_ROOT / str(year) / "data.nc"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"── Year {year} ──────────────────────────────")
 
-        for var in VARIABLES:
-            out_path = year_dir / f"{var['name']}.nc"
-            success = download_variable(client, year, var, out_path, resume=resume)
-            if not success:
-                failures.append((year, var["name"]))
-
+        success = download_year(client, year, output_path)
+        if not success:
+            failures.append(year)
         print()
 
     # Summary
-    total = len(years) * len(VARIABLES)
-    n_fail = len(failures)
-    print("=" * 50)
-    print(f"Done.  {total - n_fail}/{total} files succeeded.")
+    print("── Summary ──────────────────────────────")
+    print(f"Downloaded: {len(years) - len(failures)}/{len(years)} years")
     if failures:
-        print(f"\nFailed downloads ({n_fail}):")
-        for year, name in failures:
-            print(f"  {year}/{name}.nc")
-        print("\nRe-run with the same command to retry failed files.")
+        print(f"Failed: {', '.join(map(str, failures))}")
+        print(f"\nRe-run: python scripts/download_era5_daily.py --years {min(failures)} {max(failures)}")
         sys.exit(1)
+    else:
+        print("All downloads successful! ✓")
 
 
 if __name__ == "__main__":

@@ -4,102 +4,120 @@ An interactive world map showing where on Earth has the highest probability of *
 
 ## What is a "Perfect Day"?
 
-All four conditions must be met:
+All three conditions must be met:
 
 | Condition | Threshold |
 |---|---|
-| Maximum temperature | ≥ 75°F (23.9°C) |
-| Precipitation | < 0.5 mm |
-| Sunshine | High surface solar radiation (mostly sunny proxy) |
-| Humidity | Dew point < 60°F (15.6°C) — not uncomfortably humid |
-
-> Sunshine is measured using **surface downwelling shortwave radiation** (W/m²) from ERA5-Land, which captures what sunlight actually reaches the surface — a more accurate proxy for "mostly sunny" than cloud cover percentages.
+| Temperature | ≥ 75°F (23.9°C) |
+| Humidity | Dew point < 60°F (15.6°C) |
+| Sunshine | Cloud cover < 30% |
 
 ## Features
 
-- **Interactive World Map** — Clean Natural Earth basemap with country boundaries and key city labels
-- **Day-of-Year Slider** — Scrub through all 365 days to see the probability map shift globally
-- **Color-Blind Friendly Shading** — Single amber/orange hue that contrasts clearly with both ocean blue and land green (accessible for red-green color-blind users)
-- **Probability Shading** — Only areas with ≥ 50% probability are shown; opacity scales linearly from barely visible (50%) to nearly opaque (100%)
-- **Populated Areas Only** — Cells with fewer than ~100 people (from WorldPop 2020) are excluded
-- **Offline Capable** — All data is pre-processed into a single compact binary file loaded at startup
+- **Interactive World Map** — Natural Earth country and state/province boundaries (vector, offline), cropped to −56°/+71° latitude (no Antarctica, minimal polar distortion)
+- **Day-of-Year Slider** — Scrub through all 365 days (month labels, defaults to today) to see perfect weather migrate globally
+- **Click to Inspect** — Click anywhere to see that cell's probability, a full-year sparkline, and a "Best day" button that jumps to its peak day
+- **Play Animation** — Watch the entire year animate smoothly, showing seasonal migration
+- **Single Hue with Transparency** — Purple shading (user-selectable hue) where opacity = probability: below 50% is hidden, 50% is barely visible, 100% is mostly opaque (highest contrast, color-blind accessible)
+- **Populated Areas Only** — Cells with fewer than ~100 people (WorldPop 2020) are excluded
+- **Fast Loading** — All data pre-processed into compact binary file
+- **Fully Offline** — Leaflet is vendored locally and boundaries are GeoJSON files in `web/data/`; no tile server or internet needed
+
+The boundary GeoJSON files are committed to the repo. To re-download them:
+
+```bash
+python3 scripts/download_natural_earth.py
+```
 
 ## How Probabilities Are Computed
 
 For each 0.1° grid cell (~11 km) and each calendar day:
 
-1. A **±7-day moving window** is applied around each calendar day across 30 years (1995–2024)
-2. This yields ~450 observations per calendar day (15 days × 30 years), dramatically reducing noise from one-off anomalies
-3. The fraction of observations meeting all four conditions = the probability
+1. A **±7-day moving window** is applied around each calendar day across 15 years (2010–2024)
+2. This yields ~225 observations per calendar day (15 days × 15 years), reducing noise from anomalies
+3. The fraction of observations meeting all three conditions = the probability
 4. Cells below 50% or with insufficient population are excluded
 
 ## Data Sources
 
 | Data | Source | Notes |
 |---|---|---|
-| Temperature, dew point, solar radiation | [ERA5-Land Daily Statistics](https://cds.climate.copernicus.eu/datasets/derived-era5-land-daily-statistics) | 0.1°, 1995–2024 |
-| Precipitation | [ERA5-Land Hourly](https://cds.climate.copernicus.eu/datasets/reanalysis-era5-land) | Aggregated to daily totals |
+| Temperature, dew point, cloud cover | [ERA5 Daily Statistics](https://cds.climate.copernicus.eu/datasets/derived-era5-single-levels-daily-statistics) | 0.1° resolution, 2010–2024 |
 | Population mask | [WorldPop 2020](https://www.worldpop.org/) | 1km global, resampled to ERA5 grid |
-| Base map | [Natural Earth](https://www.naturalearthdata.com/) | 1:50m raster + vectors |
+| Political boundaries | [Natural Earth](https://www.naturalearthdata.com/) | 50m GeoJSON, bundled for offline use |
+
+## Quick Start (Users)
+
+**No dependencies, no server, fully offline:**
+
+1. Open `web/index.html` in your browser (double-click or drag to browser)
+
+That's it! The app is self-contained. All data (weather + boundaries) is bundled in `web/data.js`.
+
+Use the **slider** to explore any day of the year, or click **Play** to animate through all 365 days and watch perfect weather migrate across the globe with the seasons.
 
 ## Project Structure
 
 ```
 niceweather/
-├── data/                    # NOT in git — raw and processed data files
-│   ├── raw/
-│   │   ├── era5_daily/      # ERA5 daily stats by year (tmax, dewpoint, solar)
-│   │   ├── era5_precip/     # ERA5 hourly precip aggregated to daily
-│   │   └── worldpop/        # WorldPop population GeoTIFF
-│   └── processed/
-│       └── perfect_weather.bin  # Final compact data for the web app
-├── scripts/                 # IN git — all data processing scripts
-│   ├── download_era5_daily.py   # Download temperature, dew point, solar radiation
-│   ├── download_era5_precip.py  # Download & aggregate precipitation
-│   ├── download_worldpop.py     # Download WorldPop population mask
-│   ├── process_climate.py       # Compute per-cell daily probabilities (coming soon)
+├── data/
+│   ├── processed/
+│   │   └── perfect_weather.bin  # Climate binary (7.6 MB) → bundled into web/data.js
+│   └── raw/                     # (ERA5 downloads go here when generated)
+├── scripts/
+│   ├── download_era5_daily.py   # Fetch ERA5 climate data
+│   ├── download_worldpop.py     # Fetch population mask
+│   ├── download_natural_earth.py # Fetch boundary GeoJSON
+│   ├── process_climate.py       # Compute probabilities → binary
+│   ├── generate_synthetic_bin.py # Generate test data (auto-bundles)
+│   ├── bundle_web_data.py       # Manual bundler (binary + boundaries → web/data.js)
 │   └── requirements.txt
-├── web/                     # IN git — the interactive web app (coming soon)
-│   ├── index.html
-│   ├── app.js
-│   └── style.css
-└── spec.md                  # Full project specification and decisions log
+├── web/                         # Distribution folder (users get this)
+│   ├── index.html               # Entry point
+│   ├── app.js                   # Main app (reads from globals)
+│   ├── style.css                # Styles
+│   ├── data.js                  # Auto-generated: 14 MB bundle (all data)
+│   ├── vendor/                  # Leaflet JS/CSS (offline)
+│   └── data/                    # Source GeoJSON (not needed for users)
+├── README.md                    # This file
+├── spec.md                      # Algorithm & technical spec
+└── tasklist.md                  # Progress tracking
 ```
 
-## Getting Started (Data Pipeline)
+## For Developers: Regenerating Data from ERA5
 
-### 1. Prerequisites
+### Prerequisites
 
 - Python 3.10+
-- A free [Copernicus Climate Data Store (CDS)](https://cds.climate.copernicus.eu/) account
-- Your CDS API key in `~/.cdsapirc`:
+- Free [Copernicus CDS](https://cds.climate.copernicus.eu/) account
+- **Accept license**: https://cds.climate.copernicus.eu/datasets/derived-era5-single-levels-daily-statistics (click "Download" tab, then "Manage licences")
+- CDS API key in `~/.cdsapirc`:
   ```
   url: https://cds.climate.copernicus.eu/api
   key: <your-api-key>
   ```
 
-### 2. Install dependencies
+### Workflow
 
-```bash
-pip install -r scripts/requirements.txt
-```
+1. **Download and process climate data:**
+   ```bash
+   pip install -r scripts/requirements.txt
+   python3 scripts/download_era5_daily.py --years 2010 2024
+   python3 scripts/download_worldpop.py
+   python3 scripts/process_climate.py --calibrate-only
+   python3 scripts/process_climate.py --years 2010 2024
+   ```
+   This outputs `data/processed/perfect_weather.bin` (7.6 MB).
 
-### 3. Download the data
+2. **Bundle for web app:**
+   ```bash
+   python3 scripts/generate_synthetic_bin.py
+   # OR manually:
+   python3 scripts/bundle_web_data.py
+   ```
+   This creates `web/data.js` (14 MB, contains binary + boundaries).
 
-```bash
-# ERA5 daily stats: temperature, dew point, solar radiation (1995–2024)
-python scripts/download_era5_daily.py
-
-# ERA5 hourly precipitation, aggregated to daily totals (1995–2024)
-python scripts/download_era5_precip.py
-
-# WorldPop 2020 global population mask
-python scripts/download_worldpop.py
-```
-
-All download scripts support `--resume` (default: on) and `--years START END` to download a subset.
-
-> **Note**: The full dataset is large (~hundreds of GB). Downloads resume automatically if interrupted.
+3. **Distribute:** Users get the `web/` folder — they just open `index.html`.
 
 ## License
 

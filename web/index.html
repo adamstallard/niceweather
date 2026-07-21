@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nice Weather — Perfect Days Around the World</title>
+
+    <!-- Leaflet CSS (vendored for offline use) -->
+    <link rel="stylesheet" href="vendor/leaflet.min.css" />
+
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="container">
+        <main>
+            <!-- Day controls (top) -->
+            <div id="controls">
+                <div id="brand">🌍 Nice Weather</div>
+                <div class="control-group">
+                    <div class="slider-wrap">
+                        <input
+                            type="range"
+                            id="daySlider"
+                            min="1"
+                            max="365"
+                            value="172"
+                        >
+                        <div id="monthLabels">
+                            <span>Jan</span><span>Feb</span><span>Mar</span><span>Apr</span>
+                            <span>May</span><span>Jun</span><span>Jul</span><span>Aug</span>
+                            <span>Sep</span><span>Oct</span><span>Nov</span><span>Dec</span>
+                        </div>
+                    </div>
+                    <span id="dayDisplay">Jun 21</span>
+                    <button id="playButton">▶ Play</button>
+                </div>
+            </div>
+
+            <!-- Map -->
+            <div id="map"></div>
+
+            <!-- Legend -->
+            <div id="legend">
+                <div class="legend-bar"></div>
+                <div class="legend-labels"><span>50%</span><span>100%</span></div>
+            </div>
+
+            <!-- Hue picker -->
+            <div id="huePicker">
+                <button class="hue-swatch" data-hue="9900FF" style="background: #9900FF;" title="Purple" data-selected="true"></button>
+                <button class="hue-swatch" data-hue="FF0000" style="background: #FF0000;" title="Red"></button>
+                <button class="hue-swatch" data-hue="FF3333" style="background: #FF3333;" title="Bright Red"></button>
+                <button class="hue-swatch" data-hue="FF5500" style="background: #FF5500;" title="Deep Orange"></button>
+                <button class="hue-swatch" data-hue="FFD700" style="background: #FFD700;" title="Amber"></button>
+                <button class="hue-swatch" data-hue="FF00FF" style="background: #FF00FF;" title="Magenta"></button>
+            </div>
+
+            <!-- Loading indicator -->
+            <div id="loading" class="overlay hidden">Loading data...</div>
+        </main>
+
+        <footer>
+            <p>ERA5 (2010–2024), WorldPop 2020 |
+            <strong>≥75°F</strong>, <strong>&lt;60°F dew point</strong>, <strong>&lt;30% cloud cover</strong>
+            </p>
+        </footer>
+    </div>
+
+    <!-- Leaflet JS (vendored for offline use) -->
+    <script src="vendor/leaflet.min.js"></script>
+
+    <!-- Data bundle: binary weather + boundaries (must load before app.js) -->
+    <script src="data.js"></script>
+
+    <!-- Main app (reads from globals set by data.js) -->
+    <script src="app.js"></script>
+</body>
+</html>

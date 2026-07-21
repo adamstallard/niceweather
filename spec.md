@@ -8,98 +8,144 @@ An interactive world map overlay showing which populated areas of the world have
 
 ## "Perfect Day" Definition
 
-A day is considered **perfect** if all four conditions are met:
+A day is considered **perfect** if all three conditions are met:
 
-| Condition | Threshold | Variable Used |
+| Condition | Threshold | Variable |
 |---|---|---|
-| Max temperature | ≥ 75°F (≈ 23.9°C) | ERA5-Land daily max 2m temperature |
-| No precipitation | < 0.5 mm | ERA5-Land hourly precip, aggregated |
-| Mostly sunny | Solar radiation > threshold (TBD) | ERA5-Land daily mean surface downwelling shortwave radiation |
-| Not uncomfortably humid | Dew point < 60°F (≈ 15.6°C) | ERA5-Land daily max 2m dew point temperature |
-
-### Why solar radiation instead of cloud cover?
-Solar radiation measures what sunlight actually reaches the surface. A hazy day and a cloudy day can look similar in cloud cover metrics, but very different in experienced sunshine. Solar radiation is a more physically meaningful proxy for "mostly sunny." A threshold for "mostly sunny" will be calibrated using known sunny locations (e.g. Phoenix in summer) vs. known cloudy ones (e.g. Seattle in winter).
+| Warm | Max temperature ≥ 75°F (23.9°C) | ERA5 daily max 2m temp |
+| Comfortable humidity | Max dew point < 60°F (15.6°C) | ERA5 daily max 2m dew point |
+| Sunny | Cloud cover < 30% | ERA5 total cloud cover (fraction) |
 
 ---
 
 ## Data Sources
 
-### 1. ERA5-Land Daily Statistics (primary weather data)
-- **Source**: Copernicus Climate Data Store (CDS)
-- **Dataset ID**: `derived-era5-land-daily-statistics`
-- **Resolution**: ~0.1° × 0.1° (~11 km)
-- **Coverage**: Global land areas
-- **Period**: 1995–2024 (30 years)
-- **Variables**: daily max 2m temperature, daily max 2m dew point, daily mean surface solar radiation downwards
-- **Note**: Accumulated variables (precipitation) are intentionally excluded from this dataset
+### 1. ERA5 Post-Processed Daily Statistics
+- **CDS Dataset**: `derived-era5-single-levels-daily-statistics`
+- **Resolution**: 0.1° × 0.1° (~11 km)
+- **Period**: 2010–2024 (15 years, recent climate normal)
+- **Variables**: 2m temperature (daily max), 2m dew point (daily max), total cloud cover (daily max)
 
-### 2. ERA5-Land Hourly (precipitation only)
-- **Source**: Copernicus Climate Data Store (CDS)
-- **Dataset ID**: `reanalysis-era5-land`
-- **Variable**: `total_precipitation` (accumulated from 00:00 UTC; daily total = value at 23:00)
-- **Note**: Correct aggregation = `.resample('1D').last()` × 1000 (m → mm). Do **not** sum hourly values as they are already cumulative within the day.
-
-### 3. WorldPop Global Population (population mask)
-- **Source**: WorldPop / Humanitarian Data Exchange
-- **Resolution**: ~1 km (1km global mosaic)
-- **Year**: 2020
-- **Purpose**: Mask out areas with population < 100 per cell (scaled to ERA5 resolution)
-
-### 4. Natural Earth (basemap)
-- **Source**: naturalearthdata.com
-- **Products**: 1:50m raster base + country boundaries + populated places
-- **Purpose**: Clean, visually readable base map; country labels and key city names
+### 2. WorldPop 2020 Global Population
+- **Purpose**: Population mask (exclude cells with < 100 people)
+- **Resolution**: 1 km
+- **Resampled to**: ERA5 grid (0.1°)
 
 ---
 
 ## Probability Model
 
-For each ERA5-Land grid cell and each calendar day (1–365):
+For each populated ERA5 grid cell and each calendar day (1–365):
 
-1. Use a **±7 day moving window** around each calendar day across all 30 years
-   - e.g., for April 17: use April 10–24 for all years 1995–2024
-   - This gives 15 days × 30 years = **450 observations** per calendar day
+1. Use a **±7 day moving window** around each calendar day across 15 years (2010–2024)
+   - e.g., for April 17: use April 10–24 for all years 2010–2024
+   - This gives 15 days × 15 years = **225 observations** per calendar day
    - Reduces noise from one-off anomaly events
    - Produces a smoothly animated map as you slide between days
-2. Count how many of those 450 observations meet all four "perfect day" criteria
-3. Divide by 450 → **probability score** (0.0–1.0)
+2. Count how many of those 225 observations meet all three "perfect day" criteria
+3. Divide by 225 → **probability score** (0.0–1.0)
 4. Discard all grid cells where probability < 0.50
-5. Also discard all grid cells where population < threshold (~100 people)
+5. Only include grid cells where population ≥ 100 people (from WorldPop 2020)
+
+---
+
+## Visualization Requirements
+
+### Heatmap Rendering
+- **Single hue** (purple #9900FF) for maximum contrast
+- **Opacity scales with probability**:
+  - Below 50% probability: fully transparent (not shown)
+  - 50% probability: barely visible (opacity 0.1)
+  - 100% probability: mostly opaque (opacity 0.8)
+  - Formula: `opacity = 0.1 + ((prob - 50) / 50) * 0.7` for prob ≥ 50
+- **Result**: Only promising areas are shown; the stronger the shading, the higher the probability
+- **Note**: Purple (#9900FF) offers 2.1x better contrast than amber against the beige (land) and light-blue (ocean) map backgrounds. Accessible to colorblind users (different hue family).
+- **Canvas**: sized to the data grid resolution (capped at 2880px wide) and limited to the −56°/+71° band; cell rows are positioned using the Mercator projection so the overlay lines up exactly with the map underneath
+
+### Political Boundaries
+- Natural Earth boundaries (50m resolution, public domain), stored as GeoJSON in `web/data/`
+- Clipped to the −56°/+71° latitude band at bundle time (removes Antarctica below the band, shrinks `data.js`)
+- Rendered as non-interactive vector layers (map clicks pass through for cell inspection)
+- Shows country polygons and state/province lines
+- **Works offline** — no external tile fetches; ocean is the map background color
 
 ---
 
 ## Output Data Format
 
-A compact binary or JSON file (target: < 50 MB) containing for each grid cell:
-- Latitude, longitude (or grid index)
-- Array of 365 probability values (float16 or uint8)
-- Only cells where at least one day has probability ≥ 0.50
+### Primary (for regeneration): `data/processed/perfect_weather.bin` (~30 MB binary)
 
-This file is the only data file loaded by the web app (offline-capable after first load).
+Contains per-cell daily "perfect weather" probabilities only for cells where at least one day has probability ≥ 0.50 and population ≥ 100 people.
 
-**Note**: Raw ERA5 data (~hundreds of GB) is NOT checked into git. Only the processing scripts and the final output file (if small enough) are tracked.
+### Web app bundle: `web/data.js` (~14 MB JavaScript)
+
+Self-contained bundle for offline operation. Contains:
+- Binary weather data, base64-encoded as `window.PERFECT_WEATHER_DATA`
+- Country boundaries (GeoJSON) as `window.NE_COUNTRIES`
+- State/province lines (GeoJSON) as `window.NE_STATES`
+
+Generated by `scripts/bundle_web_data.py`. Allows the app to work offline with zero external dependencies.
+
+### Binary structure:
+
+**Header (26 bytes, big-endian)**
+| Field | Type | Bytes | Description |
+|-------|------|-------|-------------|
+| n_cells | uint32 | 4 | Number of populated cells with ≥1 day ≥50% prob |
+| n_days | uint16 | 2 | Always 365 |
+| n_lat | uint16 | 2 | Number of latitude indices in ERA5 grid |
+| n_lon | uint16 | 2 | Number of longitude indices in ERA5 grid |
+| lat_min | float32 | 4 | Minimum (southernmost) latitude |
+| lat_max | float32 | 4 | Maximum (northernmost) latitude |
+| lon_min | float32 | 4 | Minimum (westernmost) longitude |
+| lon_max | float32 | 4 | Maximum (easternmost) longitude |
+
+**Per-cell data (4 + 365 bytes per cell)**
+| Field | Type | Bytes | Description |
+|-------|------|-------|-------------|
+| lat_idx | uint16 | 2 | Index into latitude axis (0 = lat_min, southernmost) |
+| lon_idx | uint16 | 2 | Index into longitude axis (0 = lon_min, westernmost) |
+| probabilities | uint8[365] | 365 | Daily probabilities (0–100, quantized from 0.0–1.0) |
+
+This compact binary file is the only data file loaded by the web app (offline-capable after first load).
+
+**Note**: The processed `perfect_weather.bin` file (~30 MB) is committed to git. Raw ERA5 data is NOT included in the repo. If you regenerate the file with different thresholds or time periods, use the scripts in `scripts/` with your own CDS account.
 
 ---
 
 ## Shading / Visual Design
 
-- **Color**: Single hue that contrasts with both blue (ocean) and green (land)
-  - Best candidate: **amber/orange** (e.g. HSL 35°) — clearly distinct from green and blue for red-green color-blind users
+- **Color**: User-selectable single hue (purple by default, highest contrast)
+  - User can click color swatches on the map to choose: purple, red, bright red, deep orange, amber, or magenta
+  - All hues preserve the same opacity-to-probability mapping
 - **Opacity mapping**:
   - < 50% probability → not shown
-  - 50% → barely visible (~10% opacity)
-  - 100% → nearly opaque (~90% opacity)
+  - 50% → barely visible (opacity 0.1)
+  - 100% → mostly opaque (opacity 0.8)
   - Linear interpolation between those extremes
 - Shading applied as a canvas overlay on the world map
+- Legend bar updates dynamically to reflect selected hue
 
 ---
 
 ## Interactive Map
 
 - **Technology**: HTML + Vanilla JS + Canvas (offline-capable, no framework required)
-- **Map base**: Natural Earth 1:50m raster (or Mapbox/Leaflet with offline tiles TBD)
-- **Slider**: Day-of-year slider at the bottom (1–365), with month labels
-- **Interaction**: Hover to show location name + probability score for that day
+- **Map base**: Leaflet + Natural Earth 50m GeoJSON vectors (bundled in `web/data.js`)
+- **Projection**: Web Mercator (default), cropped to **−56° to +71° latitude**
+  - Excludes Antarctica (uninhabited, no useful weather data); minimizes Arctic distortion
+  - Boundary GeoJSON clipped to the band at bundle time
+  - `maxBoundsViscosity: 1.0` makes pan bounds hard (no rubber-banding past the edge)
+  - Default view shows the full band with no hidden map: the map element is sized to the band's Mercator aspect ratio, leaving any leftover space as an empty bar *below* the map; `minZoom` derived from `getBoundsZoom`
+  - Browser resize resets to the default view (full band, zoom/pan reset) at the new viewport size
+- **Data delivery**: All data (weather binary + boundaries) loaded as `<script>` globals, no `fetch()`
+- **Distribution**: Fully self-contained `web/index.html` — open directly in browser, no server needed
+- **Slider**: Day-of-year slider (1–365) with month tick labels (Jan–Dec), defaults to today's day-of-year
+- **Click to inspect**: Clicking the map opens a popup for that grid cell:
+  - Probability for the currently selected day
+  - 365-day sparkline of the cell's probabilities (with 50% threshold line and day marker)
+  - "Best day" button — jumps the slider to that cell's highest-probability day
+  - Cells with no data show a graceful message
 - **Animation**: Play button to animate through the full year
 
 ---
@@ -115,26 +161,20 @@ niceweather/
 │   │   └── worldpop/        # WorldPop GeoTIFF
 │   └── processed/
 │       └── perfect_weather.bin  # Final compact output for web app
-├── scripts/                 # IN git — all processing scripts
-│   ├── download_era5_daily.py   # Download ERA5 daily stats (temp, dewpoint, solar)
-│   ├── download_era5_precip.py  # Download ERA5 hourly precip, aggregate to daily
-│   ├── download_worldpop.py     # Download WorldPop population mask
-│   ├── process_climate.py       # Compute per-cell daily probability scores
+├── scripts/                 # Processing & bundling scripts
+│   ├── download_era5_daily.py      # Download ERA5 daily stats
+│   ├── download_worldpop.py        # Download population mask
+│   ├── download_natural_earth.py   # Download boundary GeoJSON
+│   ├── process_climate.py          # Compute per-cell probabilities
+│   ├── generate_synthetic_bin.py   # Create test data (calls bundle_web_data.py)
+│   ├── bundle_web_data.py          # Bundle data → web/data.js
 │   └── requirements.txt
-├── web/                     # IN git — the interactive web app
-│   ├── index.html
-│   ├── app.js
-│   └── style.css
-├── spec.md                  # This file
-└── README.md
+├── web/                     # Self-contained offline web app
+│   ├── index.html           # Entry point (open in browser, no server)
+│   ├── app.js               # Main app (reads from globals)
+│   ├── style.css            # Styles
+│   ├── data.js              # Auto-generated: weather binary + boundaries
+│   ├── vendor/              # Leaflet JS/CSS (offline)
+│   └── data/                # Source GeoJSON (regenerated by download_natural_earth.py)
+└── README.md, spec.md, tasklist.md
 ```
-
----
-
-## Open Questions / Future Decisions
-
-1. **Solar radiation threshold**: What W/m² constitutes "mostly sunny"? Will calibrate against known reference locations.
-2. **Final data file size**: Will the processed output fit in the repo (< 50 MB)? Depends on compression. May use uint8 (0–100) per cell per day with a lat/lon index.
-3. **Map tile approach**: Pure offline raster vs. Leaflet with cached tiles?
-4. **Leap years**: Day 366 can be handled by clamping to day 365 or ignoring Feb 29.
-5. **CDS account**: User needs a CDS account and API key in `~/.cdsapirc` to run the download scripts.
