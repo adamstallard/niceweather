@@ -24,7 +24,8 @@ Usage
   python scripts/download_era5_daily.py --years 2015 2024  # Test run
 
 Output
-  data/raw/era5_daily/<year>/data.nc
+  data/raw/era5_daily/<year>/data.nc          — Combined monthly data
+  data/raw/era5_daily/<year>/monthly/*.nc     — Individual monthly files (for reproducibility)
 """
 
 import argparse
@@ -101,17 +102,26 @@ def download_year(client: cdsapi.Client, year: int, output_path: Path) -> bool:
                 temp_zip = month_file.with_suffix('.zip')
                 client.retrieve(DATASET, request, str(temp_zip))
 
-                # Extract NetCDF from ZIP
+                # Extract NetCDF file(s) from ZIP. CDS may deliver one .nc per
+                # variable — merge them into a single monthly file.
                 with zipfile.ZipFile(temp_zip, 'r') as zf:
-                    # Find the .nc file in the zip
                     nc_files = [f for f in zf.namelist() if f.endswith('.nc')]
                     if not nc_files:
                         raise ValueError("No .nc file found in downloaded ZIP")
-                    # Extract the first .nc file with the target name
-                    zf.extract(nc_files[0], temp_dir)
-                    extracted_path = temp_dir / nc_files[0]
-                    # Rename to expected location
-                    extracted_path.rename(month_file)
+                    for nc_name in nc_files:
+                        zf.extract(nc_name, temp_dir)
+
+                if len(nc_files) == 1:
+                    (temp_dir / nc_files[0]).rename(month_file)
+                else:
+                    import xarray as xr
+                    parts = [xr.open_dataset(temp_dir / n) for n in nc_files]
+                    merged = xr.merge(parts)
+                    merged.to_netcdf(str(month_file))
+                    for p in parts:
+                        p.close()
+                    for n in nc_files:
+                        (temp_dir / n).unlink()
 
                 # Clean up zip
                 temp_zip.unlink()
@@ -142,15 +152,22 @@ def download_year(client: cdsapi.Client, year: int, output_path: Path) -> bool:
     try:
         import xarray as xr
         datasets = [xr.open_dataset(f) for f in month_files]
-        combined = xr.concat(datasets, dim="time")
+        # CDS daily statistics use 'valid_time' as the time dimension
+        time_dim = "valid_time" if "valid_time" in datasets[0].dims else "time"
+        combined = xr.concat(datasets, dim=time_dim)
         combined.to_netcdf(str(output_path))
         for ds in datasets:
             ds.close()
+
+        # Keep monthly files in a subdirectory for reproducibility and debugging
+        monthly_dir = output_path.parent / "monthly"
+        monthly_dir.mkdir(parents=True, exist_ok=True)
         for f in month_files:
-            f.unlink()
+            f.rename(monthly_dir / f.name)
 
         size_mb = output_path.stat().st_size / 1_048_576
         print(f"  [OK] Combined {year} ({size_mb:.1f} MB)")
+        print(f"  [OK] Monthly files archived to {monthly_dir.relative_to(Path.cwd())}")
         return True
     except Exception as exc:
         print(f"  [ERROR] Failed to combine months: {exc}", file=sys.stderr)

@@ -24,7 +24,7 @@ Population masking:
 
 Output format: perfect_weather.bin
 -----------------------------------
-  Header (20 bytes):
+  Header (26 bytes):
     uint32: n_cells  — number of populated cells with ≥1 day ≥50% prob
     uint16: n_days   — always 365
     uint16: n_lat    — number of latitude indices in ERA5 grid
@@ -68,9 +68,9 @@ TMAX_THRESHOLD_K = 273.15 + 23.889  # 75°F in Kelvin = 297.04 K
 # Dew point: max 2m dew point must be < 60°F (not uncomfortably humid)
 DEWPOINT_THRESHOLD_K = 273.15 + 15.556  # 60°F in Kelvin = 288.71 K
 
-# Cloud cover: must be < 50% (mostly sunny)
+# Cloud cover: must be < 30% (mostly sunny)
 # Fraction 0–1, where 0 = clear, 1 = completely overcast
-CLOUD_COVER_THRESHOLD = 0.5
+CLOUD_COVER_THRESHOLD = 0.3
 
 # Population mask: minimum people per ERA5 cell (~0.1° × 0.1°)
 # WorldPop is per km² at 1km resolution. ERA5 cells at 0.1° are ~11km²,
@@ -132,10 +132,17 @@ def load_era5_variable(var_name: str, years: list[int]) -> xr.DataArray:
         }.get(var_name, var_name)
 
         if varkey not in ds:
-            # Try first data variable if exact name not found
-            varkey = list(ds.data_vars)[0]
+            raise KeyError(
+                f"Variable '{varkey}' not found in {path} "
+                f"(has: {list(ds.data_vars)}). Re-download with "
+                "scripts/download_era5_daily.py."
+            )
 
-        arrays.append(ds[varkey])
+        da = ds[varkey]
+        # Normalize time dimension name (CDS daily stats use 'valid_time')
+        if "valid_time" in da.dims:
+            da = da.rename({"valid_time": "time"})
+        arrays.append(da)
 
     if not arrays:
         raise FileNotFoundError(
@@ -144,6 +151,26 @@ def load_era5_variable(var_name: str, years: list[int]) -> xr.DataArray:
         )
 
     return xr.concat(arrays, dim="time")
+
+
+def normalize_grid(da: xr.DataArray) -> xr.DataArray:
+    """
+    Normalize the ERA5 grid to what the web renderer expects:
+      - longitude in [-180, 180), ascending
+      - latitude ascending (lat_idx 0 = south)
+    """
+    lat_key = "latitude" if "latitude" in da.coords else "lat"
+    lon_key = "longitude" if "longitude" in da.coords else "lon"
+
+    lon = da[lon_key].values
+    if lon.max() > 180:
+        da = da.assign_coords({lon_key: ((lon + 180) % 360) - 180})
+        da = da.sortby(lon_key)
+
+    if da[lat_key].values[0] > da[lat_key].values[-1]:
+        da = da.sortby(lat_key)
+
+    return da
 
 
 def build_population_mask(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
@@ -163,14 +190,15 @@ def build_population_mask(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
     n_lat, n_lon = len(lat), len(lon)
     pop_on_era5 = np.zeros((n_lat, n_lon), dtype=np.float32)
 
-    # ERA5 grid transform (note: lat may be descending)
+    # ERA5 grid transform (raster row 0 = north; flip later if lat ascending)
     dlat = float(lat[1] - lat[0])
     dlon = float(lon[1] - lon[0])
+    lat_ascending = dlat > 0
     era5_transform = rasterio.transform.from_bounds(
-        west=float(lon[0]) - abs(dlon) / 2,
-        south=float(lat[-1]) - abs(dlat) / 2,
-        east=float(lon[-1]) + abs(dlon) / 2,
-        north=float(lat[0]) + abs(dlat) / 2,
+        west=float(lon.min()) - abs(dlon) / 2,
+        south=float(lat.min()) - abs(dlat) / 2,
+        east=float(lon.max()) + abs(dlon) / 2,
+        north=float(lat.max()) + abs(dlat) / 2,
         width=n_lon,
         height=n_lat,
     )
@@ -185,6 +213,9 @@ def build_population_mask(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
             dst_crs="EPSG:4326",
             resampling=Resampling.sum,  # sum population within each ERA5 cell
         )
+
+    if lat_ascending:
+        pop_on_era5 = pop_on_era5[::-1]  # row 0 = north → row 0 = south
 
     pop_on_era5 = np.nan_to_num(pop_on_era5, nan=0.0).clip(min=0)
     mask = pop_on_era5 >= MIN_POPULATION
@@ -318,7 +349,7 @@ def write_output(prob: np.ndarray, lat: np.ndarray, lon: np.ndarray) -> None:
     prob_u8[prob < PROB_CUTOFF] = 0
 
     with open(OUTPUT_FILE, "wb") as f:
-        # Header (20 bytes)
+        # Header (26 bytes)
         f.write(struct.pack(">I", n_cells))        # 4 bytes: number of cells
         f.write(struct.pack(">H", n_days))         # 2 bytes: days (365)
         f.write(struct.pack(">H", n_lat))          # 2 bytes: lat grid size
@@ -383,6 +414,12 @@ def main() -> None:
     tmax_da = load_era5_variable("tmax", years)
     dewpoint_da = load_era5_variable("dewpoint", years)
     cloudcover_da = load_era5_variable("cloudcover", years)
+
+    # Normalize grid: lat ascending, lon in [-180, 180) (matches web renderer
+    # and calibration site coordinates)
+    tmax_da = normalize_grid(tmax_da)
+    dewpoint_da = normalize_grid(dewpoint_da)
+    cloudcover_da = normalize_grid(cloudcover_da)
 
     # Calibration report
     calibration_report(tmax_da, dewpoint_da, cloudcover_da)
