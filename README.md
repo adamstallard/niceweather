@@ -9,8 +9,8 @@ All three conditions must be met:
 | Condition | Threshold |
 |---|---|
 | Temperature | ≥ 75°F (23.9°C) |
-| Humidity | Dew point < 60°F (15.6°C) |
-| Sunshine | Cloud cover < 30% |
+| Humidity | Dew point < 72°F (22.2°C) |
+| Sunshine | Cloud cover < 56% (daily max) |
 
 ## Features
 
