@@ -6,8 +6,8 @@ Downloads ERA5 post-processed daily statistics from Copernicus CDS for
 perfect weather analysis:
 
   - 2m temperature (daily maximum) — for ≥75°F check
-  - 2m dew point (daily maximum) — for humidity check (< 60°F)
-  - Total cloud cover (daily maximum) — for "sunny" check
+  - 2m dew point (daily maximum) — for humidity check (< 72°F)
+  - Total cloud cover (daily maximum) — for "sunny" check (current default)
 
 Uses the exact Copernicus API request syntax (year-by-year for resumability).
 
@@ -23,9 +23,16 @@ Usage
   python scripts/download_era5_daily.py --years 1995 2024
   python scripts/download_era5_daily.py --years 2015 2024  # Test run
 
+  # After all years are downloaded, upgrade cloud cover to daily mean:
+  python scripts/download_era5_daily.py --years 1995 2024 --cloud-mean
+  # This downloads ONLY total_cloud_cover (daily_mean) for each month and
+  # merges it into the existing data.nc, replacing the daily-max tcc variable.
+  # The existing tmax and dew point data are preserved untouched.
+
 Output
-  data/raw/era5_daily/<year>/data.nc          — Combined monthly data
-  data/raw/era5_daily/<year>/monthly/*.nc     — Individual monthly files (for reproducibility)
+  data/raw/era5_daily/<year>/data.nc                  — Combined annual data
+  data/raw/era5_daily/<year>/monthly/*.nc             — Monthly files (max vars)
+  data/raw/era5_daily/<year>/monthly_cloud_mean/*.nc  — Monthly cloud-mean files
 """
 
 import argparse
@@ -167,10 +174,138 @@ def download_year(client: cdsapi.Client, year: int, output_path: Path) -> bool:
 
         size_mb = output_path.stat().st_size / 1_048_576
         print(f"  [OK] Combined {year} ({size_mb:.1f} MB)")
-        print(f"  [OK] Monthly files archived to {monthly_dir.relative_to(Path.cwd())}")
+        try:
+            rel = monthly_dir.resolve().relative_to(Path.cwd().resolve())
+        except ValueError:
+            rel = monthly_dir
+        print(f"  [OK] Monthly files archived to {rel}")
         return True
     except Exception as exc:
         print(f"  [ERROR] Failed to combine months: {exc}", file=sys.stderr)
+        return False
+
+
+def download_cloud_mean_year(client: cdsapi.Client, year: int, output_path: Path) -> bool:
+    """Download ONLY total_cloud_cover (daily_mean) and merge into existing data.nc.
+
+    The existing data.nc must already contain tmax and dew point from the
+    normal download_year() run. This function:
+      1. Downloads tcc daily_mean month-by-month into monthly_cloud_mean/
+      2. Combines them into a single annual tcc_mean DataArray
+      3. Replaces the 'tcc' variable in data.nc with the mean values
+         (the existing tmax/dew point data are not touched)
+
+    Existing monthly_cloud_mean/*.nc files are skipped (resume-safe).
+    The original monthly/*.nc files are never touched.
+    """
+    import xarray as xr
+
+    if not output_path.exists() or not is_valid_netcdf(output_path):
+        print(f"  [ERROR] {output_path} does not exist — run normal download first",
+              file=sys.stderr)
+        return False
+
+    cloud_mean_dir = output_path.parent / "monthly_cloud_mean"
+    cloud_mean_dir.mkdir(parents=True, exist_ok=True)
+    month_files = []
+
+    for month_int in range(1, 13):
+        month_str = f"{month_int:02d}"
+        month_file = cloud_mean_dir / f"{year}_{month_str}_cloud_mean.nc"
+        month_files.append(month_file)
+
+        if month_file.exists() and is_valid_netcdf(month_file):
+            size_mb = month_file.stat().st_size / 1_048_576
+            print(f"    [SKIP] {year}-{month_str} cloud mean ({size_mb:.1f} MB)")
+            continue
+
+        request = {
+            "product_type": "reanalysis",
+            "variable": ["total_cloud_cover"],
+            "year": str(year),
+            "month": month_str,
+            "day": DAYS,
+            "daily_statistic": "daily_mean",
+            "time_zone": "utc+00:00",
+            "frequency": "1_hourly",
+            "format": "netcdf"
+        }
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                print(f"    [{attempt}/{MAX_RETRIES}] Downloading {year}-{month_str} cloud mean")
+                temp_zip = month_file.with_suffix('.zip')
+                client.retrieve(DATASET, request, str(temp_zip))
+
+                with zipfile.ZipFile(temp_zip, 'r') as zf:
+                    nc_files = [f for f in zf.namelist() if f.endswith('.nc')]
+                    if not nc_files:
+                        raise ValueError("No .nc file found in downloaded ZIP")
+                    for nc_name in nc_files:
+                        zf.extract(nc_name, cloud_mean_dir)
+
+                if len(nc_files) == 1:
+                    (cloud_mean_dir / nc_files[0]).rename(month_file)
+                else:
+                    parts = [xr.open_dataset(cloud_mean_dir / n) for n in nc_files]
+                    merged = xr.merge(parts, compat="override")
+                    merged.to_netcdf(str(month_file))
+                    for p in parts:
+                        p.close()
+                    for n in nc_files:
+                        (cloud_mean_dir / n).unlink()
+
+                temp_zip.unlink()
+
+                if not is_valid_netcdf(month_file):
+                    raise ValueError("NetCDF validation failed")
+
+                size_mb = month_file.stat().st_size / 1_048_576
+                print(f"    [OK] {year}-{month_str} cloud mean ({size_mb:.1f} MB)")
+                break
+
+            except Exception as exc:
+                print(f"    [ERROR] Attempt {attempt}: {exc}", file=sys.stderr)
+                if month_file.exists():
+                    month_file.unlink()
+                temp_zip = month_file.with_suffix('.zip')
+                if temp_zip.exists():
+                    temp_zip.unlink()
+                if attempt < MAX_RETRIES:
+                    print(f"    Retrying in {RETRY_DELAY_SECONDS}s …")
+                    time.sleep(RETRY_DELAY_SECONDS)
+        else:
+            print(f"    [FAIL] {MAX_RETRIES} attempts failed for {year}-{month_str} cloud mean",
+                  file=sys.stderr)
+            return False
+
+    # Combine monthly cloud-mean files and merge into existing data.nc
+    print(f"  Merging cloud mean into {output_path.name} for {year}")
+    try:
+        datasets = [xr.open_dataset(f) for f in month_files]
+        time_dim = "valid_time" if "valid_time" in datasets[0].dims else "time"
+        cloud_annual = xr.concat(datasets, dim=time_dim)
+        for ds in datasets:
+            ds.close()
+
+        # Load existing data.nc, drop old tcc, add new mean tcc
+        existing = xr.open_dataset(str(output_path))
+        updated = xr.merge(
+            [existing.drop_vars("tcc", errors="ignore"), cloud_annual[["tcc"]]],
+            compat="override"
+        )
+        existing.close()
+
+        # Write to a temp file first, then atomically replace
+        tmp_out = output_path.with_suffix(".tmp.nc")
+        updated.to_netcdf(str(tmp_out))
+        tmp_out.replace(output_path)
+
+        size_mb = output_path.stat().st_size / 1_048_576
+        print(f"  [OK] {year} data.nc updated with mean cloud cover ({size_mb:.1f} MB)")
+        return True
+    except Exception as exc:
+        print(f"  [ERROR] Failed to merge cloud mean for {year}: {exc}", file=sys.stderr)
         return False
 
 
@@ -185,6 +320,16 @@ def main() -> None:
         metavar=("START", "END"),
         default=[1995, 2024],
     )
+    parser.add_argument(
+        "--cloud-mean",
+        action="store_true",
+        help=(
+            "Download ONLY total_cloud_cover (daily_mean) and merge it into "
+            "existing data.nc files. Existing tmax/dew point data and monthly "
+            "files are never deleted. Run this after all years are downloaded "
+            "to upgrade from max to mean cloud cover (threshold: 50%% vs 56%%)."
+        ),
+    )
     args = parser.parse_args()
 
     start_year, end_year = args.years
@@ -192,7 +337,11 @@ def main() -> None:
 
     print("Nice Weather — ERA5 Daily Statistics Downloader")
     print(f"Years: {start_year}–{end_year}  ({len(years)} years)")
-    print(f"Variables: 2m temperature, 2m dew point, total cloud cover")
+    if args.cloud_mean:
+        print("Mode: cloud mean upgrade (total_cloud_cover daily_mean only)")
+        print("      Existing tmax/dew point data will NOT be modified.")
+    else:
+        print("Variables: 2m temperature, 2m dew point, total cloud cover (daily max)")
     print()
 
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
@@ -204,7 +353,11 @@ def main() -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"── Year {year} ──────────────────────────────")
 
-        success = download_year(client, year, output_path)
+        if args.cloud_mean:
+            success = download_cloud_mean_year(client, year, output_path)
+        else:
+            success = download_year(client, year, output_path)
+
         if not success:
             failures.append(year)
         print()
@@ -214,7 +367,8 @@ def main() -> None:
     print(f"Downloaded: {len(years) - len(failures)}/{len(years)} years")
     if failures:
         print(f"Failed: {', '.join(map(str, failures))}")
-        print(f"\nRe-run: python scripts/download_era5_daily.py --years {min(failures)} {max(failures)}")
+        flag = " --cloud-mean" if args.cloud_mean else ""
+        print(f"\nRe-run: python scripts/download_era5_daily.py --years {min(failures)} {max(failures)}{flag}")
         sys.exit(1)
     else:
         print("All downloads successful! ✓")
