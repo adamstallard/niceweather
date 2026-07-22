@@ -13,8 +13,8 @@ A day is considered **perfect** if all three conditions are met:
 | Condition | Threshold | Variable |
 |---|---|---|
 | Warm | Max temperature ≥ 75°F (23.9°C) | ERA5 daily max 2m temp |
-| Comfortable humidity | Max dew point < 60°F (15.6°C) | ERA5 daily max 2m dew point |
-| Sunny | Cloud cover < 30% | ERA5 total cloud cover (fraction) |
+| Comfortable humidity | Max dew point < 72°F (22.2°C) | ERA5 daily max 2m dew point |
+| Sunny | Cloud cover < 56% (daily max) or < 50% (daily mean) | ERA5 total cloud cover (fraction) |
 
 ---
 
@@ -24,7 +24,7 @@ A day is considered **perfect** if all three conditions are met:
 - **CDS Dataset**: `derived-era5-single-levels-daily-statistics`
 - **Resolution**: 0.1° × 0.1° (~11 km)
 - **Period**: 2010–2024 (15 years, recent climate normal)
-- **Variables**: 2m temperature (daily max), 2m dew point (daily max), total cloud cover (daily max)
+- **Variables**: 2m temperature (daily max), 2m dew point (daily max), total cloud cover (daily max; re-download as daily mean when historical data collection is complete)
 
 ### 2. WorldPop 2020 Global Population
 - **Purpose**: Population mask (exclude cells with < 100 people)
