@@ -116,7 +116,7 @@ def download_year(client: cdsapi.Client, year: int, output_path: Path) -> bool:
                 else:
                     import xarray as xr
                     parts = [xr.open_dataset(temp_dir / n) for n in nc_files]
-                    merged = xr.merge(parts)
+                    merged = xr.merge(parts, compat="override")
                     merged.to_netcdf(str(month_file))
                     for p in parts:
                         p.close()

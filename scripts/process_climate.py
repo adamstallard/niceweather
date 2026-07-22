@@ -13,8 +13,8 @@ For each 0.1° ERA5 grid cell:
     1. Apply a ±7-day moving window (15 days × 30 years = 450 observations)
     2. Count observations meeting ALL three "perfect day" criteria:
          a. max temperature ≥ 75°F (≥ 23.89°C = 297.04 K)
-         b. max dew point < 60°F (< 15.56°C = 288.71 K)
-         c. total cloud cover < 50% (fraction 0.5, mostly sunny)
+         b. max dew point < 72°F (< 22.22°C = 295.37 K)
+         c. total cloud cover < 56% (fraction 0.56, mostly sunny)
     3. probability = count / observations
     4. Discard cells where probability < 0.50 for ALL days
 
@@ -65,17 +65,17 @@ from tqdm import tqdm
 # Temperature: max 2m temp must reach ≥ 75°F
 TMAX_THRESHOLD_K = 273.15 + 23.889  # 75°F in Kelvin = 297.04 K
 
-# Dew point: max 2m dew point must be < 60°F (not uncomfortably humid)
-DEWPOINT_THRESHOLD_K = 273.15 + 15.556  # 60°F in Kelvin = 288.71 K
+# Dew point: max 2m dew point must be < 72°F (not uncomfortably humid)
+DEWPOINT_THRESHOLD_K = 273.15 + 22.222  # 72°F in Kelvin = 295.37 K
 
-# Cloud cover: must be < 30% (mostly sunny)
+# Cloud cover: must be < 56% (mostly sunny)
 # Fraction 0–1, where 0 = clear, 1 = completely overcast
-CLOUD_COVER_THRESHOLD = 0.3
+CLOUD_COVER_THRESHOLD = 0.56
 
 # Population mask: minimum people per ERA5 cell (~0.1° × 0.1°)
 # WorldPop is per km² at 1km resolution. ERA5 cells at 0.1° are ~11km²,
-# so a population of 100 in an ERA5 cell = very sparse habitation.
-MIN_POPULATION = 100
+# so a population of 2 in an ERA5 cell = any inhabited place.
+MIN_POPULATION = 2
 
 # Window: ±N days around each calendar day
 WINDOW_DAYS = 7  # → 15-day window × 30 years = 450 obs
