@@ -31,6 +31,11 @@ Goal: build a complete 2010–2024 dataset using `daily_maximum` statistics for 
 - [x] 3-year test suite: 64/65 pass (Phoenix smoothness at 53 pp — expected, needs more years)
 - [x] Bundle: `web/data.js` 43.2 MB
 
+### ✅ Also Done
+- [x] Memory fix: `process_climate.py` now thresholds one year at a time (`build_perfect_mask_per_year`), holding only a boolean mask in memory instead of full float32 arrays for all years — peak memory for 15 years drops from ~68 GB to ~6 GB (fits in 32 GB RAM)
+- [x] Threshold display strings (calibration report, main() banner, tests) now derive from `TMAX_THRESHOLD_K` / `DEWPOINT_THRESHOLD_K` / `CLOUD_COVER_THRESHOLD` instead of being hardcoded, so they can't go stale when Phase 3 changes the cloud threshold
+- [x] README.md thresholds updated to match spec (dew point < 72°F, cloud cover < 56% daily max)
+
 ### 🔄 In Progress
 - [/] Downloading 2010–2021: `python3 scripts/download_era5_daily.py --years 2010 2021` *(running — terminal 581540)*
 
