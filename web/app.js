@@ -339,6 +339,27 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('playButton').textContent = '▶ Play';
         renderDay(parseInt(e.target.value));
     });
+
+    // Arrow key wraparound: right on Dec 31 → Jan 1, left on Jan 1 → Dec 31
+    document.getElementById('daySlider').addEventListener('keydown', (e) => {
+        const slider = e.target;
+        const day = parseInt(slider.value);
+        if (e.key === 'ArrowRight' && day === 365) {
+            e.preventDefault();
+            slider.value = 1;
+            isPlaying = false;
+            document.getElementById('playButton').classList.remove('playing');
+            document.getElementById('playButton').textContent = '▶ Play';
+            renderDay(1);
+        } else if (e.key === 'ArrowLeft' && day === 1) {
+            e.preventDefault();
+            slider.value = 365;
+            isPlaying = false;
+            document.getElementById('playButton').classList.remove('playing');
+            document.getElementById('playButton').textContent = '▶ Play';
+            renderDay(365);
+        }
+    });
     
     // Play button
     document.getElementById('playButton').addEventListener('click', startPlayback);
