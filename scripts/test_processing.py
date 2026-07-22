@@ -42,10 +42,12 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 def test_thresholds():
     print("\n── Thresholds match spec ──")
-    check("tmax ≥ 75°F", abs(pc.TMAX_THRESHOLD_K - 297.039) < 0.01)
-    check("dew point < 72°F", abs(pc.DEWPOINT_THRESHOLD_K - 295.372) < 0.01)
-    check("cloud cover < 56% (daily max)", pc.CLOUD_COVER_THRESHOLD == 0.56,
-          f"got {pc.CLOUD_COVER_THRESHOLD}")
+    tmax_f = pc.k_to_f(pc.TMAX_THRESHOLD_K)
+    dew_f = pc.k_to_f(pc.DEWPOINT_THRESHOLD_K)
+    check(f"tmax ≥ {tmax_f:.0f}°F", abs(pc.TMAX_THRESHOLD_K - 297.039) < 0.01)
+    check(f"dew point < {dew_f:.0f}°F", abs(pc.DEWPOINT_THRESHOLD_K - 295.372) < 0.01)
+    check(f"cloud cover < {pc.CLOUD_COVER_THRESHOLD * 100:.0f}% (daily max)",
+          pc.CLOUD_COVER_THRESHOLD == 0.56, f"got {pc.CLOUD_COVER_THRESHOLD}")
 
 
 def test_doy_mapping():
@@ -221,6 +223,86 @@ def test_raw_data():
         ds.close()
 
 
+def test_per_year_path_equivalence():
+    """
+    The memory-bounded per-year path (build_perfect_mask_per_year +
+    compute_probability_from_perfect) must produce output identical to the
+    all-at-once path (concat all years → compute_probability_map).
+    Uses tiny synthetic netCDF files in a temp dir, mimicking real ERA5
+    layout: lat descending 90→-90, lon 0→360, 'valid_time' dim, leap year.
+    """
+    print("\n── Per-year path ≡ all-at-once path (synthetic netCDF) ──")
+    import tempfile
+    import xarray as xr
+    import pandas as pd
+
+    rng = np.random.default_rng(42)
+    n_lat, n_lon = 5, 8
+    lat = np.linspace(90, -90, n_lat)          # descending, like real ERA5
+    lon = np.arange(0, 360, 360 / n_lon)       # 0–360, like real ERA5
+
+    def make_year_ds(year, n_days):
+        times = pd.date_range(f"{year}-01-01", periods=n_days, freq="D")
+        shape = (n_days, n_lat, n_lon)
+        # Values straddle all three thresholds so the mask is non-trivial
+        t2m = rng.uniform(285, 310, shape).astype(np.float32)
+        d2m = rng.uniform(280, 300, shape).astype(np.float32)
+        tcc = rng.uniform(0, 1, shape).astype(np.float32)
+        return xr.Dataset(
+            {v: (("valid_time", "latitude", "longitude"), arr)
+             for v, arr in [("t2m", t2m), ("d2m", d2m), ("tcc", tcc)]},
+            coords={"valid_time": times, "latitude": lat, "longitude": lon},
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_root = Path(tmp)
+        datasets = {}
+        for year, n_days in [(2023, 365), (2024, 366)]:  # includes leap year
+            ydir = tmp_root / str(year)
+            ydir.mkdir()
+            ds = make_year_ds(year, n_days)
+            ds.to_netcdf(ydir / "data.nc")
+            datasets[year] = ds
+
+        orig_root = pc.ERA5_DAILY
+        pc.ERA5_DAILY = tmp_root
+        try:
+            pop = np.ones((n_lat, n_lon), dtype=bool)
+            pop[0, 0] = False  # exercise the population mask too
+
+            # New memory-bounded path (2025 requested but missing → skipped)
+            perfect, doys = pc.build_perfect_mask_per_year([2023, 2024, 2025])
+            prob_new = pc.compute_probability_from_perfect(perfect, doys, pop)
+
+            # Old all-at-once path: concat → normalize → compute
+            combined = xr.concat(
+                [datasets[2023], datasets[2024]], dim="valid_time"
+            ).rename({"valid_time": "time"})
+            t_da = pc.normalize_grid(combined["t2m"])
+            d_da = pc.normalize_grid(combined["d2m"])
+            c_da = pc.normalize_grid(combined["tcc"])
+            doys_old = pc.compute_calendar_day_index(t_da.time.values)
+            # Both paths normalize the grid first, so the same pop mask
+            # (indices in the normalized grid) applies to both
+            prob_old = pc.compute_probability_map(
+                t_da.values.astype(np.float32),
+                d_da.values.astype(np.float32),
+                c_da.values.astype(np.float32),
+                doys_old, pop,
+            )
+
+            check("doys identical", np.array_equal(doys, doys_old))
+            check("T dimension = 731 (365+366)", perfect.shape[0] == 731,
+                  f"got {perfect.shape[0]}")
+            check("probability maps identical",
+                  np.array_equal(prob_new, prob_old),
+                  f"max abs diff {np.abs(prob_new - prob_old).max()}")
+            check("perfect mask is boolean (1 byte/obs)",
+                  perfect.dtype == np.bool_, f"got {perfect.dtype}")
+        finally:
+            pc.ERA5_DAILY = orig_root
+
+
 def test_multi_year_obs_counts():
     """
     Step 2: verify the observation pool size is correct when multiple years are
@@ -383,6 +465,7 @@ def main() -> None:
     test_binary_roundtrip()
     test_population_mask()
     test_raw_data()
+    test_per_year_path_equivalence()
     test_multi_year_obs_counts()
     test_multi_year_convergence()
     print(f"\n{'='*50}\nResults: {PASS} passed, {FAIL} failed")

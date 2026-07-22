@@ -113,45 +113,62 @@ CALIBRATION_SITES = {
 # ---------------------------------------------------------------------------
 
 
-def load_era5_variable(var_name: str, years: list[int]) -> xr.DataArray:
-    """Load ERA5 daily statistics variable across all years."""
-    arrays = []
-    for year in tqdm(years, desc=f"Loading {var_name}", unit="yr"):
-        path = ERA5_DAILY / str(year) / "data.nc"
+def k_to_f(k: float) -> float:
+    """Convert Kelvin to Fahrenheit."""
+    return (k - 273.15) * 9 / 5 + 32
 
-        if not path.exists():
-            print(f"  [WARN] Missing: {path}", file=sys.stderr)
-            continue
 
-        ds = xr.open_dataset(path, engine="netcdf4")
+def _open_era5_variable(var_name: str, year: int) -> xr.DataArray:
+    """
+    Lazily open a single year's ERA5 variable (no data read from disk yet —
+    only metadata/coords). Normalizes the time dimension name.
+    """
+    path = ERA5_DAILY / str(year) / "data.nc"
+    ds = xr.open_dataset(path, engine="netcdf4")
 
-        # Map our names to ERA5 variable names
-        varkey = {
-            "tmax": "t2m",
-            "dewpoint": "d2m",
-            "cloudcover": "tcc",
-        }.get(var_name, var_name)
+    # Map our names to ERA5 variable names
+    varkey = {
+        "tmax": "t2m",
+        "dewpoint": "d2m",
+        "cloudcover": "tcc",
+    }.get(var_name, var_name)
 
-        if varkey not in ds:
-            raise KeyError(
-                f"Variable '{varkey}' not found in {path} "
-                f"(has: {list(ds.data_vars)}). Re-download with "
-                "scripts/download_era5_daily.py."
-            )
-
-        da = ds[varkey]
-        # Normalize time dimension name (CDS daily stats use 'valid_time')
-        if "valid_time" in da.dims:
-            da = da.rename({"valid_time": "time"})
-        arrays.append(da)
-
-    if not arrays:
-        raise FileNotFoundError(
-            f"No data found for '{var_name}'. "
-            "Run: python scripts/download_era5_daily.py"
+    if varkey not in ds:
+        raise KeyError(
+            f"Variable '{varkey}' not found in {path} "
+            f"(has: {list(ds.data_vars)}). Re-download with "
+            "scripts/download_era5_daily.py."
         )
 
-    return xr.concat(arrays, dim="time")
+    da = ds[varkey]
+    # Normalize time dimension name (CDS daily stats use 'valid_time')
+    if "valid_time" in da.dims:
+        da = da.rename({"valid_time": "time"})
+    return da
+
+
+def get_normalized_grid_coords(years: list[int]) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Return (lat, lon) of the ERA5 grid in the web convention (lat ascending,
+    lon in [-180, 180) ascending), read from the first available year's file.
+    Reads coordinates only — never the data variables — so it is cheap
+    regardless of how many years are on disk.
+    """
+    for year in years:
+        path = ERA5_DAILY / str(year) / "data.nc"
+        if not path.exists():
+            continue
+        with xr.open_dataset(path, engine="netcdf4") as ds:
+            lat = np.sort(ds["latitude"].values)
+            lon = ds["longitude"].values
+            if lon.max() > 180:
+                lon = ((lon + 180) % 360) - 180
+            lon = np.sort(lon)
+        return lat, lon
+    raise FileNotFoundError(
+        "No data found for any requested year. "
+        "Run: python scripts/download_era5_daily.py"
+    )
 
 
 def normalize_grid(da: xr.DataArray) -> xr.DataArray:
@@ -236,26 +253,53 @@ def compute_calendar_day_index(time: np.ndarray) -> np.ndarray:
     return doys
 
 
-def calibration_report(
-    tmax: xr.DataArray,
-    dewpoint: xr.DataArray,
-    cloudcover: xr.DataArray,
-) -> None:
-    """Print stats for calibration sites to validate thresholds."""
+def calibration_report(years: list[int]) -> None:
+    """
+    Print stats for calibration sites to validate thresholds.
+    Reads only the calibration cells (single-point time series) from each
+    year's file — never a full grid — so memory stays trivial regardless of
+    how many years are requested.
+    """
     print("\n── Calibration report ──────────────────────────────────")
-    print(f"{'Site':<40} {'Tmax≥75F':>8} {'DP<72F':>8} {'Cloud<56%':>10}")
+    header_tmax = f"Tmax≥{k_to_f(TMAX_THRESHOLD_K):.0f}F"
+    header_dp = f"DP<{k_to_f(DEWPOINT_THRESHOLD_K):.0f}F"
+    header_cloud = f"Cloud<{CLOUD_COVER_THRESHOLD * 100:.0f}%"
+    print(f"{'Site':<40} {header_tmax:>8} {header_dp:>8} {header_cloud:>10}")
     print("─" * 70)
 
-    lat_vals = tmax.latitude.values if "latitude" in tmax.coords else tmax.lat.values
-    lon_vals = tmax.longitude.values if "longitude" in tmax.coords else tmax.lon.values
+    # Accumulate per-site time series across years (tiny: 365 values/site/yr)
+    site_series = {name: ([], [], []) for name in CALIBRATION_SITES}
 
-    for name, (site_lat, site_lon) in CALIBRATION_SITES.items():
-        ilat = int(np.argmin(np.abs(lat_vals - site_lat)))
-        ilon = int(np.argmin(np.abs(lon_vals - site_lon)))
+    for year in years:
+        path = ERA5_DAILY / str(year) / "data.nc"
+        if not path.exists():
+            continue
+        with xr.open_dataset(path, engine="netcdf4") as ds:
+            lat_vals = ds["latitude"].values
+            lon_vals = ds["longitude"].values
+            lon_0360 = lon_vals.max() > 180
 
-        t = tmax.isel(latitude=ilat, longitude=ilon).values
-        d = dewpoint.isel(latitude=ilat, longitude=ilon).values
-        c = cloudcover.isel(latitude=ilat, longitude=ilon).values
+            for name, (site_lat, site_lon) in CALIBRATION_SITES.items():
+                lookup_lon = site_lon % 360 if lon_0360 else site_lon
+                # Angular distance handles wraparound (e.g. site at -0.1°
+                # → 359.9° must resolve to the 0.0° cell, not 359.75°)
+                dlon = np.abs(lon_vals - lookup_lon)
+                dlon = np.minimum(dlon, 360 - dlon)
+                ilat = int(np.argmin(np.abs(lat_vals - site_lat)))
+                ilon = int(np.argmin(dlon))
+                sel = dict(latitude=ilat, longitude=ilon)
+                t_l, d_l, c_l = site_series[name]
+                t_l.append(ds["t2m"].isel(**sel).values)
+                d_l.append(ds["d2m"].isel(**sel).values)
+                c_l.append(ds["tcc"].isel(**sel).values)
+
+    for name, (t_l, d_l, c_l) in site_series.items():
+        if not t_l:
+            print(f"{name:<40} {'—':>8} {'—':>8} {'—':>10}")
+            continue
+        t = np.concatenate(t_l)
+        d = np.concatenate(d_l)
+        c = np.concatenate(c_l)
 
         n = len(t)
         pct_tmax = 100 * np.sum(t >= TMAX_THRESHOLD_K) / n
@@ -272,26 +316,31 @@ def calibration_report(
 # ---------------------------------------------------------------------------
 
 
-def compute_probability_map(
+def compute_perfect_mask(
     tmax: np.ndarray,   # shape (T, lat, lon) — Kelvin
     dewpoint: np.ndarray,  # shape (T, lat, lon) — Kelvin
     cloudcover: np.ndarray,  # shape (T, lat, lon) — fraction 0–1
-    doys: np.ndarray,   # shape (T,) day-of-year 1..365
-    pop_mask: np.ndarray,  # shape (lat, lon) bool
 ) -> np.ndarray:
-    """
-    Compute per-cell daily probabilities.
-    Returns array shape (lat, lon, 365), dtype float32, values 0.0–1.0.
-    """
-    T, n_lat, n_lon = tmax.shape
-    prob = np.zeros((n_lat, n_lon, 365), dtype=np.float32)
-
-    # Pre-compute per-day "perfect" boolean array
-    perfect = (
+    """Boolean 'perfect day' mask (dtype=bool), same shape as inputs."""
+    return (
         (tmax >= TMAX_THRESHOLD_K) &
         (dewpoint < DEWPOINT_THRESHOLD_K) &
         (cloudcover < CLOUD_COVER_THRESHOLD)
-    )  # shape (T, lat, lon)
+    )
+
+
+def compute_probability_from_perfect(
+    perfect: np.ndarray,  # shape (T, lat, lon) — bool
+    doys: np.ndarray,     # shape (T,) day-of-year 1..365
+    pop_mask: np.ndarray,  # shape (lat, lon) bool
+) -> np.ndarray:
+    """
+    Compute per-cell daily probabilities from a precomputed boolean
+    "perfect day" mask. Returns array shape (lat, lon, 365), dtype float32,
+    values 0.0–1.0.
+    """
+    T, n_lat, n_lon = perfect.shape
+    prob = np.zeros((n_lat, n_lon, 365), dtype=np.float32)
 
     print("  Computing per-cell probabilities …")
     for cal_day in tqdm(range(1, 366), desc="Calendar days", unit="day"):
@@ -319,6 +368,78 @@ def compute_probability_map(
     # Zero out unpopulated cells
     prob[~pop_mask] = 0.0
     return prob
+
+
+def compute_probability_map(
+    tmax: np.ndarray,   # shape (T, lat, lon) — Kelvin
+    dewpoint: np.ndarray,  # shape (T, lat, lon) — Kelvin
+    cloudcover: np.ndarray,  # shape (T, lat, lon) — fraction 0–1
+    doys: np.ndarray,   # shape (T,) day-of-year 1..365
+    pop_mask: np.ndarray,  # shape (lat, lon) bool
+) -> np.ndarray:
+    """
+    Compute per-cell daily probabilities directly from raw variable arrays
+    already resident in memory. Convenience wrapper around
+    compute_perfect_mask + compute_probability_from_perfect — used by the
+    test suite and any caller with a small enough period to hold all three
+    float32 arrays at once. The main pipeline uses the memory-bounded
+    per-year path instead (see build_perfect_mask_per_year), which never
+    holds more than one year of float32 data at a time.
+    """
+    perfect = compute_perfect_mask(tmax, dewpoint, cloudcover)
+    return compute_probability_from_perfect(perfect, doys, pop_mask)
+
+
+def build_perfect_mask_per_year(
+    years: list[int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Memory-bounded alternative to loading every year's tmax/dewpoint/
+    cloudcover float32 arrays into memory simultaneously. Processes one
+    year at a time — load its three float32 arrays, reduce immediately to
+    a 1-byte-per-observation boolean "perfect day" mask, then discard the
+    floats — before moving to the next year. This cuts peak memory by
+    roughly 12x versus concatenating all years as float32 first (e.g. 15
+    years: ~68 GB → ~6 GB).
+
+    Returns (perfect, doys):
+      perfect — shape (T_total, n_lat, n_lon), dtype=bool
+      doys    — shape (T_total,), day-of-year 1..365
+    """
+    perfect_chunks = []
+    doy_chunks = []
+
+    for year in tqdm(years, desc="Processing years", unit="yr"):
+        path = ERA5_DAILY / str(year) / "data.nc"
+        if not path.exists():
+            print(f"  [WARN] Missing: {path}", file=sys.stderr)
+            continue
+
+        tmax_da = normalize_grid(_open_era5_variable("tmax", year))
+        dewpoint_da = normalize_grid(_open_era5_variable("dewpoint", year))
+        cloudcover_da = normalize_grid(_open_era5_variable("cloudcover", year))
+
+        tmax_np = tmax_da.values.astype(np.float32)
+        dewpoint_np = dewpoint_da.values.astype(np.float32)
+        cloudcover_np = cloudcover_da.values.astype(np.float32)
+        doy_chunks.append(compute_calendar_day_index(tmax_da.time.values))
+
+        perfect_chunks.append(
+            compute_perfect_mask(tmax_np, dewpoint_np, cloudcover_np)
+        )
+
+        del tmax_np, dewpoint_np, cloudcover_np
+        del tmax_da, dewpoint_da, cloudcover_da
+
+    if not perfect_chunks:
+        raise FileNotFoundError(
+            "No data found for any requested year. "
+            "Run: python scripts/download_era5_daily.py"
+        )
+
+    perfect = np.concatenate(perfect_chunks, axis=0)
+    doys = np.concatenate(doy_chunks, axis=0)
+    return perfect, doys
 
 
 # ---------------------------------------------------------------------------
@@ -405,52 +526,35 @@ def main() -> None:
     print(f"Window: ±{WINDOW_DAYS} days → {2 * WINDOW_DAYS + 1} days × {len(years)} years")
     print(f"  = {(2 * WINDOW_DAYS + 1) * len(years)} max observations per calendar day")
     print(f"\nThresholds:")
-    print(f"  Temperature   ≥ {TMAX_THRESHOLD_K - 273.15:.1f}°C (75°F)")
-    print(f"  Dew point     < {DEWPOINT_THRESHOLD_K - 273.15:.1f}°C (72°F)")
+    print(f"  Temperature   ≥ {TMAX_THRESHOLD_K - 273.15:.1f}°C ({k_to_f(TMAX_THRESHOLD_K):.0f}°F)")
+    print(f"  Dew point     < {DEWPOINT_THRESHOLD_K - 273.15:.1f}°C ({k_to_f(DEWPOINT_THRESHOLD_K):.0f}°F)")
     print(f"  Cloud cover   < {CLOUD_COVER_THRESHOLD * 100:.0f}% (mostly sunny)")
     print()
 
-    # Load all variables
-    print("── Loading ERA5 data ──────────────────────────────────")
-    tmax_da = load_era5_variable("tmax", years)
-    dewpoint_da = load_era5_variable("dewpoint", years)
-    cloudcover_da = load_era5_variable("cloudcover", years)
-
-    # Normalize grid: lat ascending, lon in [-180, 180) (matches web renderer
-    # and calibration site coordinates)
-    tmax_da = normalize_grid(tmax_da)
-    dewpoint_da = normalize_grid(dewpoint_da)
-    cloudcover_da = normalize_grid(cloudcover_da)
-
-    # Calibration report
-    calibration_report(tmax_da, dewpoint_da, cloudcover_da)
+    # Calibration report (reads only calibration-site cells — trivial memory)
+    calibration_report(years)
 
     if args.calibrate_only:
         print("Calibration-only mode — exiting without writing output.")
         return
 
-    # Extract lat/lon coordinates
-    lat_key = "latitude" if "latitude" in tmax_da.coords else "lat"
-    lon_key = "longitude" if "longitude" in tmax_da.coords else "lon"
-    lat = tmax_da[lat_key].values
-    lon = tmax_da[lon_key].values
+    # Grid coordinates in the normalized (web) convention — coords only,
+    # no data variables read
+    lat, lon = get_normalized_grid_coords(years)
 
     # Build population mask
     print("\n── Building population mask ───────────────────────────")
     pop_mask = build_population_mask(lat, lon)
 
-    # Load data into memory as numpy arrays
-    print("\n── Loading data into memory ───────────────────────────")
-    tmax_np = tmax_da.values.astype(np.float32)
-    dewpoint_np = dewpoint_da.values.astype(np.float32)
-    cloudcover_np = cloudcover_da.values.astype(np.float32)
-    doys = compute_calendar_day_index(tmax_da.time.values)
+    # Load + threshold data one year at a time to bound peak memory (see
+    # build_perfect_mask_per_year docstring for rationale).
+    print("\n── Loading + thresholding data (per year) ─────────────")
+    perfect, doys = build_perfect_mask_per_year(years)
 
     # Compute probability maps
     print("\n── Computing probability maps ─────────────────────────")
-    prob = compute_probability_map(
-        tmax_np, dewpoint_np, cloudcover_np, doys, pop_mask
-    )
+    prob = compute_probability_from_perfect(perfect, doys, pop_mask)
+    del perfect
 
     # Write output
     print("\n── Writing output ─────────────────────────────────────")
