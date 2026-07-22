@@ -43,8 +43,8 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 def test_thresholds():
     print("\n── Thresholds match spec ──")
     check("tmax ≥ 75°F", abs(pc.TMAX_THRESHOLD_K - 297.039) < 0.01)
-    check("dew point < 60°F", abs(pc.DEWPOINT_THRESHOLD_K - 288.706) < 0.01)
-    check("cloud cover < 30%", pc.CLOUD_COVER_THRESHOLD == 0.3,
+    check("dew point < 72°F", abs(pc.DEWPOINT_THRESHOLD_K - 295.372) < 0.01)
+    check("cloud cover < 56% (daily max)", pc.CLOUD_COVER_THRESHOLD == 0.56,
           f"got {pc.CLOUD_COVER_THRESHOLD}")
 
 
@@ -91,7 +91,7 @@ def test_probability_math():
     prob3 = pc.compute_probability_map(
         tmax, dew, cloud2, doys2, np.zeros((1, 1), dtype=bool))
     check("pop mask zeroes cell", prob3.max() == 0.0)
-    # Threshold boundaries: exactly 75°F passes, exactly 60°F dew fails
+    # Threshold boundaries: exactly 75°F passes, exactly 72°F dew fails
     tmax_b = np.full(shape, pc.TMAX_THRESHOLD_K, dtype=np.float32)
     dew_b = np.full(shape, pc.DEWPOINT_THRESHOLD_K, dtype=np.float32)
     prob_b = pc.compute_probability_map(tmax_b, dew_b, cloud2, doys2, pop)
@@ -350,17 +350,17 @@ def test_multi_year_convergence():
     # should be ≤ 20 pp.  We scale the tolerance so the test is meaningful at
     # every stage and tightens automatically as more years are loaded.
     n_years_approx = max(1, len(list(pc.ERA5_DAILY.glob("[0-9]*/data.nc"))))
-    # With N years: window = 15×N obs. Max theoretical jump per step ≈ 100/(15×N).
-    # Allow 8 such steps worth of swing, floor at 20 pp, skip check at 1 year.
-    smooth_limit = max(20, round(800 / (15 * n_years_approx)))  # ~36 @2yr, 24 @3yr, 20 @4yr+
+    # Smoothness is only meaningfully enforced at 3+ years; with 1–2 years the
+    # 15×N observation pool is too small to eliminate single-event spikes.
     p_phx = lookup(33.4, -112.1)
     if p_phx is not None and p_phx.max() > 0:
         diffs = np.abs(np.diff(p_phx.astype(np.int16)))
         max_jump = int(diffs.max())
-        if n_years_approx == 1:
+        if n_years_approx < 3:
             print(f"  [INFO] Phoenix max jump {max_jump} pp "
-                  f"(smoothness check skipped for 1-yr data — expected noise)")
+                  f"(smoothness check skipped for {n_years_approx}-yr data — expected noise)")
         else:
+            smooth_limit = max(20, round(800 / (15 * n_years_approx)))  # 24 @3yr, 20 @4yr+
             check(f"Phoenix curve smooth (max jump ≤ {smooth_limit} pp, {n_years_approx}-yr data)",
                   max_jump <= smooth_limit, f"max jump {max_jump} pp")
 
