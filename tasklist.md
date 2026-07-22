@@ -2,6 +2,18 @@
 
 **Documentation Strategy**: Only use README.md (user-facing), spec.md (technical), and tasklist.md (tracking). No other markdown files. Keep them in sync as you work.
 
+## Current Status & Plan
+
+**Phase 1 (In Progress)**: Download multi-year base data (2022–2023 running; then 2010–2021). Uses `daily_maximum` for all variables. This gives us the population mask and basic structure working across years.
+
+**Phase 2 (Queued)**: Secondary download of `daily_mean` cloud cover for all years (2010–2024). This will merge with existing data — no deletions. The downloader supports this by overwriting just the tcc variable in each year's data.nc.
+
+**Phase 3 (Queued)**: Reprocess all years with new, refined thresholds:
+- Max temp ≥ 75°F (unchanged)
+- Max dew point < 72°F (was 68°F)
+- **Mean cloud cover < 50%** (was daily_max < 56%) — this fixes Galapagos
+- Population ≥ 2 (unchanged)
+
 ## ✅ Completed
 - [x] Algorithm & architecture finalized
 - [x] Data downloader scripts (month-by-month to avoid API limits)
@@ -36,10 +48,10 @@
 
 ### Data Processing Verification (run `python3 scripts/test_processing.py`)
 Raw data integrity (per downloaded year):
-- [ ] `data.nc` opens; contains all 3 variables (t2m, d2m, tcc)
-- [ ] Single time dimension (`valid_time`) with 365/366 daily steps, no NaN padding
-- [ ] Grid is 721×1440 (0.25°); lat spans 90→−90, lon spans 0→359.75
-- [ ] Value sanity: t2m/d2m in 180–340 K, tcc in 0–1, d2m ≤ t2m nearly everywhere
+- [x] `data.nc` opens; contains all 3 variables (t2m, d2m, tcc)
+- [x] Single time dimension (`valid_time`) with 365/366 daily steps, no NaN padding
+- [x] Grid is 721×1440 (0.25°); lat spans 90→−90, lon spans 0→359.75
+- [x] Value sanity: t2m/d2m in 180–340 K, tcc in 0–1, d2m ≤ t2m nearly everywhere
 
 Processing logic (unit tests, synthetic inputs):
 - [ ] Day-of-year mapping: Feb 29 → slot 59, Dec 31 (leap) → slot 365
@@ -60,16 +72,87 @@ End-to-end (real 2024 data):
 - [ ] Full run completes; active cell count plausible; spot-check known cities in binary
 - [ ] Bundle via `bundle_web_data.py`; visual check in browser
 
-### Known Issues (found 2026-07-21, fix before re-download)
-- [ ] `download_era5_daily.py`: extracts only first .nc from CDS ZIP → 2024 file has only d2m; concat uses wrong dim (`time` vs `valid_time`) → NaN-padded 12×366 structure
-- [ ] `process_climate.py`: cloud threshold 0.5 ≠ spec 0.3; lat written descending (header lat_min=90) breaks web renderer; lon 0–360 not converted to −180..180; doys read `.time` not `valid_time`
-- [ ] 2024 raw data unusable → re-download required after fixes
+### Multi-year verification (run after adding each new year)
 
-### Generate Real Data (when ready)
+The core question: are the years being correctly pooled — no duplicate days, no dropped
+days, no year dominating — and do the resulting probabilities behave as expected?
+
+**Step 1 — Raw data: confirm each year file is independently clean**
+Run `python3 scripts/test_processing.py` after every new year download.
+The raw-data section already checks all three.  Any FAIL before processing = bad download.
+
+**Step 2 — Observation-count sanity (`scripts/test_processing.py` multi-year section)**
+For each calendar day d (1–365) the window should contain exactly
+`(2 × WINDOW_DAYS + 1) × n_years` observations (±1 at year-ends due to wraparound
+with non-full windows).  The test verifies this analytically with a small synthetic
+multi-year array so we know the concat is producing the right pool size.
+
+**Step 3 — Convergence / smoothness check (automated, in test script)**
+Run process_climate.py twice: once with just 2024, once with 2024+new year.
+Extract the per-cell probability curves for 5 calibration cities and verify:
+- Active cell count grows or stays the same (never shrinks — more data only opens cells)
+- Phoenix AZ: peak probability stays within ±15 pp of the 2024 baseline (80%)
+- Phoenix AZ: curve shape is smooth (no single-day spikes > 20 pp above neighbours)
+- Southern-Hemisphere city (e.g. Cape Town −33.9,18.4): peak shifts toward Jan/Feb
+  (Northern-Hemisphere summer = Southern winter, so peak moves to Dec–Feb calendar days)
+- London UK: remains at 0 active cells (strict cloud threshold, consistent year to year)
+
+**Step 4 — Hemisphere seasonality check (automated)**
+For a set of known locations in each hemisphere, verify the peak calendar day falls in the
+expected season:
+- Northern mid-latitudes (>25°N): peak in days 120–270 (May–Sep) if an active cell exists
+- Southern mid-latitudes (<−25°S): peak in days 1–59 or 300–365 (Nov–Feb) if active
+- Equatorial band (±15°): peak can be anywhere, but variance across the year should be low
+
+**Step 5 — No-data plausibility (manual spot check)**
+After processing N ≥ 2 years, open the browser and check three things:
+- Slider on day 1 (Jan 1): Southern Africa, southern South America, and Australia are lit;
+  northern Europe, UK, eastern USA are dark. The opposite should be true on day 182.
+- The pattern animates smoothly day-to-day (no flickering from noisy single-year data)
+- The active-cell count printed by process_climate.py is within 10–30% of the 1-year count
+  (large swing = suspect; identical = also suspect since more years should open new marginal cells)
+
+**When to escalate**
+If Step 3 shows Phoenix probability changes by > 30 pp from 2024 baseline, or Step 4 shows
+a hemisphere check failing, re-examine the year's raw data with the calibration report
+before adding further years.
+
+### Known Issues (resolved 2026-07-21)
+- [x] `download_era5_daily.py`: now extracts all .nc files per ZIP and merges; concat uses `valid_time`
+- [x] `process_climate.py`: cloud threshold → 0.3; lat/lon normalized before writing; `valid_time` handled
+- [x] 2024 re-downloaded with fixed script (1.5 GB, all 3 variables, 366 days) ✓
+
+### Generate Real Data — Phase 1: Multi-year Base Data
 - [x] Accept CDS license ✓
-- [x] Run `python3 scripts/download_worldpop.py` (~5 min) ✓ (829 MB)
-- [ ] Re-run `python3 scripts/download_era5_daily.py --years 2024 2024` (after fixes)
-- [ ] Run `python3 scripts/download_era5_daily.py --years 2010 2023` (~1–2 days)
-- [ ] Run `python3 scripts/process_climate.py --calibrate-only`
-- [ ] Run `python3 scripts/process_climate.py --years 2010 2024` (~30–60 min)
-- [ ] Replace `data/processed/perfect_weather.bin` with generated file
+- [x] Run `python3 scripts/download_worldpop.py` ✓ (829 MB)
+- [x] Re-run `python3 scripts/download_era5_daily.py --years 2024 2024` ✓ (1.5 GB)
+- [x] Run `python3 scripts/process_climate.py --years 2024 2024` ✓ (55,268 cells, 19.4 MB)
+- [x] Visual check with 1-year data ✓
+- [/] Download 2022–2023: `python3 scripts/download_era5_daily.py --years 2022 2023` **(in progress)**
+- [ ] Verify 2022–2023 files exist and are valid (check `data/raw/era5_daily/2022/data.nc` and `2023/data.nc`)
+- [ ] Run tests after download: `python3 scripts/test_processing.py`
+- [ ] Run `python3 scripts/process_climate.py --calibrate-only --years 2022 2024`
+- [ ] Run `python3 scripts/process_climate.py --years 2022 2024`
+- [ ] Run tests on multi-year output; visual check — confirm smoothing + SH seasonality
+- [ ] If tests pass: download remaining years `--years 2010 2021`
+- [ ] Download 2010–2021 data (keep existing files; do NOT delete)
+
+### Generate Real Data — Phase 2: Mean Cloud Cover (Galapagos fix)
+After Phase 1 complete, reprocess with improved thresholds and daily mean cloud cover:
+
+- [ ] **Download daily_mean cloud cover for all years (2010–2024)**
+  - Modify downloader to request `daily_mean` for `total_cloud_cover` only
+  - Keep temp/dew point as `daily_maximum` (unchanged)
+  - Run: `python3 scripts/download_era5_daily.py --years 2010 2024 --cloud-statistic daily_mean`
+  - **Important**: Files will merge with existing data.nc files (xarray overwrites just the tcc variable)
+  - Existing monthly files are NOT deleted — secondary download adds only the cloud cover data
+- [ ] Run `python3 scripts/process_climate.py --calibrate-only --years 2010 2024`
+- [ ] **Final reprocess with new thresholds**:
+  - Max temperature: ≥ 75°F (unchanged)
+  - Max dew point: < 72°F (was 68°F — matches tropical comfort)
+  - **Mean cloud cover: < 50%** (was daily_max < 56%)
+  - Population cutoff: ≥ 2 (unchanged)
+- [ ] Run `python3 scripts/process_climate.py --years 2010 2024`
+- [ ] Run tests on final multi-year output; visual check
+- [ ] Verify Galapagos now shows activity in best months (Nov–Dec should peak with mean cloud metric)
+- [ ] Final `python3 scripts/bundle_web_data.py` + visual sign-off

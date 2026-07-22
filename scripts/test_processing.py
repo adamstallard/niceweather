@@ -221,6 +221,160 @@ def test_raw_data():
         ds.close()
 
 
+def test_multi_year_obs_counts():
+    """
+    Step 2: verify the observation pool size is correct when multiple years are
+    concatenated.  Uses a small synthetic array to check analytically — no real
+    data needed.
+    """
+    print("\n── Multi-year observation counts (synthetic) ──")
+    import xarray as xr, pandas as pd
+
+    def make_year(year_str, n_days):
+        """Return a tiny (n_days, 1, 1) DataArray for the given year."""
+        times = pd.date_range(year_str, periods=n_days, freq="D")
+        return xr.DataArray(
+            np.ones((n_days, 1, 1), dtype=np.float32),
+            dims=("time", "latitude", "longitude"),
+            coords={"time": times},
+        )
+
+    # Build 3 synthetic years: 365, 366 (leap), 365 days
+    years_da = [make_year("2022-01-01", 365),
+                make_year("2023-01-01", 366),
+                make_year("2024-01-01", 365)]
+    combined = xr.concat(years_da, dim="time")
+    doys = pc.compute_calendar_day_index(combined.time.values)
+    W = pc.WINDOW_DAYS
+
+    def obs_in_window(cal_day):
+        lo, hi = cal_day - W, cal_day + W
+        if lo < 1 and hi > 365:
+            return np.ones(len(doys), dtype=bool)
+        elif lo < 1:
+            return (doys <= hi) | (doys >= (365 + lo))
+        elif hi > 365:
+            return (doys >= lo) | (doys <= (hi - 365))
+        else:
+            return (doys >= lo) & (doys <= hi)
+
+    n_years = len(years_da)
+    expected = (2 * W + 1) * n_years  # 15 × 3 = 45
+    # Check mid-year day (no wraparound) and year-end days
+    for cal_day in [100, 182, 1, 365]:
+        n_obs = obs_in_window(cal_day).sum()
+        # Allow ±n_years tolerance for year-boundary edge cases
+        ok = abs(n_obs - expected) <= n_years
+        check(f"day {cal_day}: obs={n_obs} ≈ {expected} (±{n_years})", ok,
+              f"got {n_obs}")
+
+
+def test_multi_year_convergence():
+    """
+    Steps 3 & 4: load the current perfect_weather.bin (assumed to be from the
+    most recently processed run) and check geographic/seasonal sanity.
+    Skips gracefully if the binary is missing or is the synthetic one (< 1 MB).
+    """
+    print("\n── Multi-year geographic/seasonal sanity (real binary) ──")
+    if not pc.OUTPUT_FILE.exists():
+        print("  [SKIP] no perfect_weather.bin")
+        return
+    if pc.OUTPUT_FILE.stat().st_size < 1_000_000:
+        print("  [SKIP] binary looks synthetic (< 1 MB)")
+        return
+
+    buf = pc.OUTPUT_FILE.read_bytes()
+    n_cells, n_days, n_lat, n_lon = struct.unpack(">IHHH", buf[:10])
+    lat_min, lat_max, lon_min, lon_max = struct.unpack(">ffff", buf[10:26])
+
+    check("binary: lat ascending", lat_min < lat_max)
+    check("binary: lon in [-180,180)", lon_min >= -180 and lon_max < 180)
+    check("binary: n_cells plausible (1 k – 500 k)", 1_000 <= n_cells <= 500_000,
+          f"got {n_cells:,}")
+
+    # Parse all cells into a dict {(i_lat, i_lon): uint8 array[365]}
+    cells = {}
+    offset = 26
+    for _ in range(n_cells):
+        i_lat, i_lon = struct.unpack(">HH", buf[offset:offset + 4])
+        probs = np.frombuffer(buf[offset + 4:offset + 4 + 365], dtype=np.uint8)
+        cells[(i_lat, i_lon)] = probs
+        offset += 369
+
+    lat_res = (lat_max - lat_min) / (n_lat - 1)
+    lon_res = (lon_max - lon_min) / (n_lon - 1)
+
+    def lookup(target_lat, target_lon):
+        i_lat = round((target_lat - lat_min) / lat_res)
+        i_lon = round((target_lon - lon_min) / lon_res)
+        # search ±2 cells in case of rounding
+        for di in range(-2, 3):
+            for dj in range(-2, 3):
+                p = cells.get((i_lat + di, i_lon + dj))
+                if p is not None:
+                    return p
+        return None
+
+    def peak_day(probs):
+        return int(np.argmax(probs)) + 1  # 1-based
+
+    # --- Hemisphere seasonality ---
+    # Northern mid-latitude: interior SoCal should peak May–Sep (days 121–273)
+    p_socal = lookup(33.5, -116.5)
+    if p_socal is not None and p_socal.max() > 0:
+        pd_socal = peak_day(p_socal)
+        check("SoCal peak in Northern summer (days 100–280)", 100 <= pd_socal <= 280,
+              f"peak day {pd_socal}")
+    else:
+        print("  [INFO] SoCal not active — normal for ≤2 years with 30% cloud threshold")
+
+    # Southern mid-latitude: Cape Town should peak Nov–Feb (days 305–365 or 1–59)
+    p_cpt = lookup(-33.9, 18.4)
+    if p_cpt is not None and p_cpt.max() > 0:
+        pd_cpt = peak_day(p_cpt)
+        in_sh_summer = pd_cpt >= 305 or pd_cpt <= 59
+        check("Cape Town peak in Southern summer (Nov–Feb)", in_sh_summer,
+              f"peak day {pd_cpt}")
+    else:
+        print("  [INFO] Cape Town not active — may need more years")
+
+    # London: should remain dark (strict cloud + dew threshold)
+    p_lon = lookup(51.5, -0.1)
+    check("London has no active cell", p_lon is None or p_lon.max() == 0,
+          f"max prob {p_lon.max() if p_lon is not None else 'N/A'}")
+
+    # --- Smoothness: day-to-day jumps shrink as years are added ---
+    # With N years the window has 15*N obs; a single day turning over changes
+    # probability by at most 100/15 ≈ 7 pp per year boundary crossing.
+    # In practice with 1 year jagged curves are normal; by 3+ years max jump
+    # should be ≤ 20 pp.  We scale the tolerance so the test is meaningful at
+    # every stage and tightens automatically as more years are loaded.
+    n_years_approx = max(1, len(list(pc.ERA5_DAILY.glob("[0-9]*/data.nc"))))
+    # With N years: window = 15×N obs. Max theoretical jump per step ≈ 100/(15×N).
+    # Allow 8 such steps worth of swing, floor at 20 pp, skip check at 1 year.
+    smooth_limit = max(20, round(800 / (15 * n_years_approx)))  # ~36 @2yr, 24 @3yr, 20 @4yr+
+    p_phx = lookup(33.4, -112.1)
+    if p_phx is not None and p_phx.max() > 0:
+        diffs = np.abs(np.diff(p_phx.astype(np.int16)))
+        max_jump = int(diffs.max())
+        if n_years_approx == 1:
+            print(f"  [INFO] Phoenix max jump {max_jump} pp "
+                  f"(smoothness check skipped for 1-yr data — expected noise)")
+        else:
+            check(f"Phoenix curve smooth (max jump ≤ {smooth_limit} pp, {n_years_approx}-yr data)",
+                  max_jump <= smooth_limit, f"max jump {max_jump} pp")
+
+    # --- No-data in extreme polar regions (above 71°N / below 56°S after bundler crop) ---
+    # These are clipped in bundle_web_data.py but the binary itself may still contain them;
+    # the check is that any cell at lat > 72 is outside the populated band anyway.
+    polar_cells = [(k, v) for k, v in cells.items()
+                   if lat_min + k[0] * lat_res > 72.0]
+    # Not a hard failure — just informational
+    if polar_cells:
+        print(f"  [INFO] {len(polar_cells)} cells above 72°N in binary "
+              "(cropped by bundler, not rendered)")
+
+
 def main() -> None:
     test_thresholds()
     test_doy_mapping()
@@ -229,6 +383,8 @@ def main() -> None:
     test_binary_roundtrip()
     test_population_mask()
     test_raw_data()
+    test_multi_year_obs_counts()
+    test_multi_year_convergence()
     print(f"\n{'='*50}\nResults: {PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)
 
