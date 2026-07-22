@@ -66,10 +66,11 @@ from tqdm import tqdm
 TMAX_THRESHOLD_K = 273.15 + 23.889  # 75°F in Kelvin = 297.04 K
 
 # Dew point: max 2m dew point must be < 72°F (not uncomfortably humid)
-DEWPOINT_THRESHOLD_K = 273.15 + 22.222  # 72°F in Kelvin = 295.37 K
+DEWPOINT_THRESHOLD_K = 273.15 + 22.222  # 72°F in Kelvin = 295.372 K
 
-# Cloud cover: must be < 56% (mostly sunny)
+# Cloud cover: must be < 56% when using daily max (mostly sunny)
 # Fraction 0–1, where 0 = clear, 1 = completely overcast
+# NOTE: if/when re-downloading with daily mean, use 0.50 instead.
 CLOUD_COVER_THRESHOLD = 0.56
 
 # Population mask: minimum people per ERA5 cell (~0.1° × 0.1°)
@@ -242,7 +243,7 @@ def calibration_report(
 ) -> None:
     """Print stats for calibration sites to validate thresholds."""
     print("\n── Calibration report ──────────────────────────────────")
-    print(f"{'Site':<40} {'Tmax≥75F':>8} {'DP<60F':>8} {'Cloud<50%':>10}")
+    print(f"{'Site':<40} {'Tmax≥75F':>8} {'DP<72F':>8} {'Cloud<56%':>10}")
     print("─" * 70)
 
     lat_vals = tmax.latitude.values if "latitude" in tmax.coords else tmax.lat.values
@@ -405,7 +406,7 @@ def main() -> None:
     print(f"  = {(2 * WINDOW_DAYS + 1) * len(years)} max observations per calendar day")
     print(f"\nThresholds:")
     print(f"  Temperature   ≥ {TMAX_THRESHOLD_K - 273.15:.1f}°C (75°F)")
-    print(f"  Dew point     < {DEWPOINT_THRESHOLD_K - 273.15:.1f}°C (60°F)")
+    print(f"  Dew point     < {DEWPOINT_THRESHOLD_K - 273.15:.1f}°C (72°F)")
     print(f"  Cloud cover   < {CLOUD_COVER_THRESHOLD * 100:.0f}% (mostly sunny)")
     print()
 
